@@ -121,6 +121,12 @@ class PodClient:
         resp.raise_for_status()
         return resp.json()
 
+    def cancel_job(self, pod_job_id: str) -> None:
+        """Stop the pipeline on the pod (`apps/api/main.py::cancel_job`). Best effort: raises on
+        HTTP failure, and the caller decides what that means."""
+        resp = self.request("POST", f"/api/jobs/{pod_job_id}/cancel")
+        resp.raise_for_status()
+
     # ---------------------------------------------------------------- generic proxy
 
     def proxy(self, method: str, path_qs: str, headers: dict[str, str], body: bytes | None) -> requests.Response:

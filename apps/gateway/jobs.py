@@ -342,7 +342,16 @@ class JobWorker:
         prefix_logs = [line for line in current.get("logs", []) if not line.startswith("[pod] ")]
         unreachable_since: float | None = None
         while not self._stop.is_set():
-            self._check_cancelled(job_id)
+            if self.store.is_cancelled(job_id):
+                # Cancel job / Stop GPU: stop the pipeline on the pod too, so it does not keep
+                # the GPU busy (and billing) for a result nobody wants. Stop GPU also deletes the
+                # pod, which ends it regardless -- so a failure here is only logged.
+                try:
+                    self.pod.cancel_job(pod_job_id)
+                    self.store.update(job_id, log="Stopped the pipeline on the GPU pod.")
+                except requests.RequestException as exc:
+                    logger.warning("job %s: could not cancel pod job %s: %s", job_id, pod_job_id, exc)
+                raise JobCancelled(job_id)
             self.pods.touch()  # a job in flight is GPU use: no idle auto-stop under it
             try:
                 pod_job = self.pod.job_status(pod_job_id)

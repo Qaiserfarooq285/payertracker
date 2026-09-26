@@ -4,6 +4,7 @@ Provides REST endpoints and media streaming for video upload, player detection, 
 jersey OCR, event detection, movement analytics, and stat card visualization.
 """
 
+import ctypes
 import hashlib
 import hmac
 import json
@@ -258,6 +259,33 @@ def _attach_job_log(job: dict[str, Any]) -> _JobLogHandler:
     handler = _JobLogHandler(job, threading.get_ident())
     logging.getLogger().addHandler(handler)
     return handler
+
+
+class JobCancelled(BaseException):
+    """Raised INSIDE a running pipeline thread by `POST /api/jobs/{id}/cancel` (2026-09-26: owner
+    -- "if a job is started and someone stops it, the processing should stop as well"). A
+    BaseException on purpose: the pipeline has many `except Exception` blocks that would otherwise
+    swallow it and carry on burning GPU time."""
+
+
+# job_id -> thread ident of the pipeline thread running it. Guarded so a cancel can never be fired
+# at a thread that has already moved on to other work (the threadpool reuses threads).
+_JOB_THREADS: dict[str, int] = {}
+_JOB_THREADS_LOCK = threading.Lock()
+
+
+def _set_async_exc(thread_id: int, exc: type[BaseException] | None) -> int:
+    return ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(thread_id), ctypes.py_object(exc) if exc is not None else None
+    )
+
+
+def _release_job_thread(job_id: str) -> None:
+    """Forget the job's thread and clear any cancel that is still pending on it, so it can never
+    land in whatever the thread runs next."""
+    with _JOB_THREADS_LOCK:
+        if _JOB_THREADS.pop(job_id, None) is not None:
+            _set_async_exc(threading.get_ident(), None)
 
 
 def _disk_free_gb(path: Path) -> float:
@@ -1035,6 +1063,14 @@ def _run_pipeline_job(
 
     job = JOBS[job_id]
     log_handler = _attach_job_log(job)
+    if job.get("cancel_requested"):  # cancelled while still queued: never start
+        job.update(status="failed", stage="Cancelled", error="cancelled")
+        logging.getLogger().removeHandler(log_handler)
+        with _INFLIGHT_LOCK:
+            _INFLIGHT_SLUGS.discard(_job_slug_for_release)
+        return
+    with _JOB_THREADS_LOCK:
+        _JOB_THREADS[job_id] = threading.get_ident()
     job["status"] = "processing"
     job["progress"] = 5
     job["stage"] = "Initializing Environment"
@@ -1331,13 +1367,26 @@ def _run_pipeline_job(
         job["status"] = "failed"
         job["error"] = message
         job["logs"].append(f"ERROR: {message}")
+    except JobCancelled:
+        logger.info("pipeline job %s cancelled", job_id)
+        job["status"] = "failed"
+        job["stage"] = "Cancelled"
+        job["error"] = "cancelled"
+        job["logs"].append("Cancelled -- the pipeline was stopped.")
     finally:
-        logging.getLogger().removeHandler(log_handler)
-        # Always release this video, success or failure -- a crashed run must never leave its slug
-        # permanently locked out (that would turn one bad run into "this video can never be
-        # processed again" until the server restarts).
-        with _INFLIGHT_LOCK:
-            _INFLIGHT_SLUGS.discard(_job_slug_for_release)
+        # A cancel that raced the end of the run must not escape into the cleanup below.
+        for _attempt in range(3):
+            try:
+                _release_job_thread(job_id)
+                logging.getLogger().removeHandler(log_handler)
+                # Always release this video, success or failure -- a crashed run must never leave
+                # its slug permanently locked out (that would turn one bad run into "this video
+                # can never be processed again" until the server restarts).
+                with _INFLIGHT_LOCK:
+                    _INFLIGHT_SLUGS.discard(_job_slug_for_release)
+                break
+            except JobCancelled:
+                continue
 
 
 @app.post("/api/process")
@@ -1408,6 +1457,25 @@ def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
         "status": "queued",
         "message": f"Started pipeline job {job_id} for {req.video_name}",
     }
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """Stop a queued or running pipeline job. A running one gets `JobCancelled` raised in its own
+    thread, which takes effect the next time the pipeline is back in Python (between frames /
+    batches -- usually well under a second; a long single ffmpeg call finishes first)."""
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job ID not found")
+    if job["status"] in ("completed", "failed"):
+        return job
+    job["cancel_requested"] = True
+    with _JOB_THREADS_LOCK:
+        thread_id = _JOB_THREADS.get(job_id)
+        if thread_id is not None:
+            _set_async_exc(thread_id, JobCancelled)
+    job["logs"].append("Cancel requested -- stopping the pipeline.")
+    return job
 
 
 @app.get("/api/status/{job_id}")

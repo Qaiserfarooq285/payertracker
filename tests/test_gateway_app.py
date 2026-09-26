@@ -141,6 +141,9 @@ class FakePodClient:
     def job_status(self, pod_job_id):
         return self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
 
+    def cancel_job(self, pod_job_id):
+        self.cancelled = getattr(self, "cancelled", []) + [pod_job_id]
+
 
 class FakePods:
     """The PodManager surface the worker uses. `script` is the phases the user's Start walks
@@ -476,3 +479,28 @@ def test_pod_create_body_uses_the_gateway_when_configured():
     assert "$PV_GATEWAY_URL/pod/bootstrap.sh" in cmd and "GITHUB_TOKEN" not in cmd
     legacy = main_rp.pod_create_body(name="p", gpu_type_ids=["x"], volume_id="v", env={})
     assert "raw.githubusercontent.com" in legacy["dockerStartCmd"][-1]
+
+
+def test_cancelling_a_running_job_stops_the_pipeline_on_the_pod(tmp_path):
+    """Cancel job / Stop GPU while the pod is processing: the pod is told to stop the pipeline,
+    so it does not keep the GPU busy for a result nobody wants."""
+    running = {"status": "running", "stage": "Detection", "progress": 20, "logs": ["detecting"]}
+    pod = FakePodClient([running], has_video=True)
+    store = JobStore(tmp_path / "jobs.json")
+    (tmp_path / "input").mkdir()
+    (tmp_path / "input" / "a.mp4").write_bytes(b"v")
+    job = store.create("a.mp4", {"video_name": "a.mp4"})
+    polls = {"n": 0}
+
+    def sleep(_s):
+        polls["n"] += 1
+        if polls["n"] == 3:  # a few polls into the run, the user presses Cancel job
+            store.cancel(job["job_id"], "cancelled by you")
+
+    worker = JobWorker(store, FakePods(), pod, tmp_path / "input", sleep=sleep, clock=lambda: 0.0)
+    with pytest.raises(jobs_mod.JobCancelled):
+        worker.run_job(job)
+    assert pod.cancelled == ["podjob1"]
+    final = store.get(job["job_id"])
+    assert final["stage"] == "Cancelled"
+    assert final["logs"][-1] == "Stopped the pipeline on the GPU pod."

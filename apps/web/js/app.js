@@ -472,7 +472,10 @@ function gpuIsUsable() {
   return !gpuStopping && (pod.phase === 'online' || gpuPower.starting || pod.wanted);
 }
 
-function fmtMoney(v) { return `$${Number(v).toFixed(2)}`; }
+function fmtMoney(v) {
+  const n = Number(v);
+  return `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)}`;
+}
 
 function renderGpuPower() {
   const box = document.getElementById('gpu-power');
@@ -640,9 +643,8 @@ async function resumeActiveJob() {
     if (!active.length) return;
     const job = active[active.length - 1];
     logTerminal(`Resuming job ${job.job_id} for '${job.video_name}' (${job.status.replace(/_/g, ' ')}).`, 'info');
-    document.getElementById('btn-process').disabled = true;
-    document.getElementById('btn-process').innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Processing Video...`;
     activeJobId = job.job_id;
+    setRunButtonForJob(job.status);
     document.getElementById('btn-cancel-job')?.classList.remove('hidden');
     startJobPolling(activeJobId);
   } catch (err) {
@@ -789,7 +791,7 @@ async function startPipelineProcessing() {
     'info'
   );
   document.getElementById('btn-process').disabled = true;
-  document.getElementById('btn-process').innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Processing Video...`;
+  document.getElementById('btn-process').innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Queueing...`;
 
   try {
     const payload = {
@@ -858,6 +860,7 @@ async function checkJobStatus(jobId) {
     const job = await res.json();
 
     updateProgressBar(job.progress, job.stage);
+    setRunButtonForJob(job.status);
     document.getElementById('job-status-badge').textContent =
       job.stage === 'Cancelled' ? 'CANCELLED' : job.status.replace(/_/g, ' ').toUpperCase();
 
@@ -887,6 +890,19 @@ async function checkJobStatus(jobId) {
   } catch (err) {
     console.warn('Status poll error:', err);
   }
+}
+
+// While a job is in flight the Run button says what it is actually doing -- a queued job that is
+// only waiting for the GPU must not read "Processing" (nothing is running or billing then).
+function setRunButtonForJob(status) {
+  const btn = document.getElementById('btn-process');
+  if (!btn || !['queued', 'waiting_gpu', 'starting_gpu', 'uploading', 'running'].includes(status)) return;
+  btn.disabled = true;
+  btn.innerHTML = status === 'waiting_gpu' || status === 'queued'
+    ? `<i class="fa-solid fa-hourglass-half"></i> Queued -- waiting for the GPU`
+    : status === 'starting_gpu'
+      ? `<i class="fa-solid fa-spinner fa-spin"></i> Queued -- GPU starting`
+      : `<i class="fa-solid fa-spinner fa-spin"></i> Processing Video...`;
 }
 
 function highlightFlowStage(stageName) {

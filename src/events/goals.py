@@ -45,9 +45,11 @@ and `src.pipeline.extended_output` (ADR-15's filename-less flow) call identicall
 
 from __future__ import annotations
 
+import itertools
 import math
 import re
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -282,13 +284,35 @@ def detect_goals_scoreboard_delta(
     Returns `(occurrence_events, debug)`; `debug` is `scan_candidate_regions`'s own audit trail,
     plus (when a region activated) the raw per-sample score series and the increments found.
     """
-    n_activation = min(len(frames), goal_cfg["activation_frames_count"])
-    activated_region, debug = scan_candidate_regions(reader, frames[:n_activation], goal_cfg)
+    if len(times) != len(frames):
+        raise ValueError("times and frames must be the same length")
+    return detect_goals_scoreboard_delta_stream(reader, zip(times, frames), take_id, goal_cfg)
+
+
+def detect_goals_scoreboard_delta_stream(
+    reader: Any,
+    timed_frames: Iterable[tuple[float, np.ndarray]],
+    take_id: int | None,
+    goal_cfg: dict,
+) -> tuple[list[Event], dict]:
+    """`detect_goals_scoreboard_delta` over a STREAM of `(t, frame)` -- same result, bounded
+    memory (2026-09-26, long videos). Only the first `activation_frames_count` frames are ever held
+    whole (the region scan needs them together); after that each frame is reduced to its
+    scoreboard crop and dropped. When no region activates -- no scoreboard, the owner's usual
+    footage -- the stream is not consumed any further, so the rest of the take is never decoded.
+    Holding every native frame of a single-take 90-min match here was tens of GB of RAM."""
+    it = iter(timed_frames)
+    head: list[tuple[float, np.ndarray]] = []
+    for item in it:
+        head.append(item)
+        if len(head) >= goal_cfg["activation_frames_count"]:
+            break
+    activated_region, debug = scan_candidate_regions(reader, [f for _t, f in head], goal_cfg)
     if activated_region is None:
         return [], debug
 
     samples: list[tuple[float, int]] = []
-    for t, frame in zip(times, frames, strict=True):
+    for t, frame in itertools.chain(head, it):
         crop = _crop_region(frame, activated_region)
         parsed = parse_scoreboard_text(_ocr_region_text(reader, crop))
         if parsed is not None:
@@ -896,22 +920,23 @@ def detect_goals_for_take(
     goal_cfg = events_cfg["goal"]
     assist_cfg = events_cfg["assist"]
 
-    times: list[float] = []
-    frames: list[np.ndarray] = []
-    for _idx, t, frame in decode_frames(
-        video_path,
-        fps=goal_cfg["scoreboard_ocr_fps_sample"],
-        start=take.t_start,
-        end=take.t_end,
-        scale_width=None,
-        use_nvdec=use_nvdec,
-    ):
-        times.append(t)
-        frames.append(frame.copy())
-
-    occurrence_events, debug = detect_goals_scoreboard_delta(
-        reader, frames, times, take.id, goal_cfg
+    scoreboard_frames = (
+        (t, frame.copy())
+        for _idx, t, frame in decode_frames(
+            video_path,
+            fps=goal_cfg["scoreboard_ocr_fps_sample"],
+            start=take.t_start,
+            end=take.t_end,
+            scale_width=None,
+            use_nvdec=use_nvdec,
+        )
     )
+    try:
+        occurrence_events, debug = detect_goals_scoreboard_delta_stream(
+            reader, scoreboard_frames, take.id, goal_cfg
+        )
+    finally:
+        scoreboard_frames.close()  # stop ffmpeg now when the scan ended the stream early
 
     region_events: list[Event] = []
     region_attempted = False

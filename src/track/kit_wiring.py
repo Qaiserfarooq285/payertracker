@@ -102,7 +102,45 @@ def build_take_kit_colour(
     if not all_ts:
         return {}, {}
 
-    decoded_frames: list[tuple[float, np.ndarray]] = []
+    tolerance_s = 1.0 / identity_cfg["crop"]["identity_fps_sample"]
+    number_crop_cfg = identity_cfg["parseq_soccernet"]["number_crop"]
+
+    lab_samples_by_track: dict[int, list[np.ndarray]] = {}
+    band_samples_by_track: dict[int, list[KitColourSample]] = {}
+
+    # Every (time, track, box) this take wants a colour read at, in time order. The frames are
+    # STREAMED past these (2026-09-26, long videos): this used to keep every native-resolution frame
+    # of the take in a list, and a single-camera match is often ONE take -- a 90-min 1080p match at
+    # 2 fps is ~67 GB, more RAM than the pod has. Only the previous frame is held now; the frame
+    # used for each read is still the nearest decoded one (earlier on a tie), exactly as before.
+    wanted: list[tuple[float, int, object]] = []
+    for tr in take_tracks:
+        boxes_by_t = {b.t: b for b in tr.boxes}
+        for target_t in target_ts_by_track[tr.id]:
+            box = boxes_by_t.get(target_t)
+            if box is not None:
+                wanted.append((target_t, tr.id, box))
+    wanted.sort(key=lambda w: w[0])
+
+    def read_at(frame_entry: tuple[float, np.ndarray], target_t: float, track_id: int, box) -> None:
+        frame_t, frame_bgr = frame_entry
+        if abs(frame_t - target_t) > tolerance_s:
+            return
+        x1, y1, x2, y2 = _scale_bbox_to_native(box.bbox, scale_x, scale_y, 0.0, native_w, native_h)
+        if x2 <= x1 or y2 <= y1:
+            return
+        native_bbox = BBox(x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2))
+
+        lab_result = kit_lab_sample(frame_bgr, native_bbox, number_crop_cfg, kit_colour_cfg)
+        if lab_result is not None:
+            lab_samples_by_track.setdefault(track_id, []).append(lab_result[0])
+
+        band_sample = sample_kit_bands(frame_bgr, native_bbox, take.id, target_t, target_cfg)
+        if band_sample is not None:
+            band_samples_by_track.setdefault(track_id, []).append(band_sample)
+
+    prev: tuple[float, np.ndarray] | None = None
+    i = 0
     for _idx, frame_t, frame in decode_frames(
         str(video_path),
         fps=identity_cfg["crop"]["identity_fps_sample"],
@@ -111,40 +149,21 @@ def build_take_kit_colour(
         scale_width=None,
         use_nvdec=use_nvdec,
     ):
-        decoded_frames.append((frame_t, frame))
-    if not decoded_frames:
+        # Reads whose time this frame has reached: nearest is this frame or the previous one.
+        while i < len(wanted) and wanted[i][0] <= frame_t:
+            target_t, track_id, box = wanted[i]
+            nearest = (frame_t, frame)
+            if prev is not None and abs(prev[0] - target_t) <= abs(frame_t - target_t):
+                nearest = prev
+            read_at(nearest, target_t, track_id, box)
+            i += 1
+        prev = (frame_t, frame)
+    if prev is None:
         return {}, {}
-
-    tolerance_s = 1.0 / identity_cfg["crop"]["identity_fps_sample"]
-    number_crop_cfg = identity_cfg["parseq_soccernet"]["number_crop"]
-
-    lab_samples_by_track: dict[int, list[np.ndarray]] = {}
-    band_samples_by_track: dict[int, list[KitColourSample]] = {}
-
-    for tr in take_tracks:
-        boxes_by_t = {b.t: b for b in tr.boxes}
-        for target_t in target_ts_by_track[tr.id]:
-            box = boxes_by_t.get(target_t)
-            if box is None:
-                continue
-            frame_entry = min(decoded_frames, key=lambda f: abs(f[0] - target_t), default=None)
-            if frame_entry is None or abs(frame_entry[0] - target_t) > tolerance_s:
-                continue
-            _t, frame_bgr = frame_entry
-            x1, y1, x2, y2 = _scale_bbox_to_native(
-                box.bbox, scale_x, scale_y, 0.0, native_w, native_h
-            )
-            if x2 <= x1 or y2 <= y1:
-                continue
-            native_bbox = BBox(x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2))
-
-            lab_result = kit_lab_sample(frame_bgr, native_bbox, number_crop_cfg, kit_colour_cfg)
-            if lab_result is not None:
-                lab_samples_by_track.setdefault(tr.id, []).append(lab_result[0])
-
-            band_sample = sample_kit_bands(frame_bgr, native_bbox, take.id, target_t, target_cfg)
-            if band_sample is not None:
-                band_samples_by_track.setdefault(tr.id, []).append(band_sample)
+    while i < len(wanted):  # reads after the last decoded frame: that frame is the nearest
+        target_t, track_id, box = wanted[i]
+        read_at(prev, target_t, track_id, box)
+        i += 1
 
     kit_lab_by_track_id: dict[int, np.ndarray] = {}
     for track_id, samples in lab_samples_by_track.items():

@@ -243,7 +243,17 @@ def pod_create_body(
             "echo EXIT=$? >>/workspace/bootstrap.log; sleep infinity"
         )
     else:
-        start_cmd = f"{fetch} | bash"
+        # If the bootstrap cannot be fetched, fails, or the app exits with an error, the pod STOPS
+        # ITSELF (RunPod injects RUNPOD_POD_ID; the gateway passes RUNPOD_API_KEY) instead of
+        # letting RunPod restart the container in a billing loop -- a guard that does not depend
+        # on the gateway being up. (`curl | bash` hid a failed fetch: bash exits 0 on no input.)
+        stop_self = (
+            'echo "[pitchvision] bootstrap/app failed -- stopping this pod so it does not bill"; '
+            '[ -n "$RUNPOD_API_KEY" ] && [ -n "$RUNPOD_POD_ID" ] && curl -fsS -X POST '
+            '-H "Authorization: Bearer $RUNPOD_API_KEY" -H "Content-Type: application/json" '
+            f"-A {USER_AGENT} -d '{{}}' \"{REST_BASE}/pods/$RUNPOD_POD_ID/stop\"; sleep 60"
+        )
+        start_cmd = f"{fetch} -o /tmp/pv-bootstrap.sh && bash /tmp/pv-bootstrap.sh || {{ {stop_self}; }}"
     return {
         "name": name,
         "imageName": IMAGE,

@@ -477,6 +477,8 @@ def test_pod_create_body_uses_the_gateway_when_configured():
     body = main_rp.pod_create_body(name="p", gpu_type_ids=["x"], volume_id="v", env=env)
     cmd = body["dockerStartCmd"][-1]
     assert "$PV_GATEWAY_URL/pod/bootstrap.sh" in cmd and "GITHUB_TOKEN" not in cmd
+    # a failed fetch/bootstrap/app stops the pod itself rather than crash-looping on the bill
+    assert "|| {" in cmd and "/pods/$RUNPOD_POD_ID/stop" in cmd and "| bash" not in cmd
     legacy = main_rp.pod_create_body(name="p", gpu_type_ids=["x"], volume_id="v", env={})
     assert "raw.githubusercontent.com" in legacy["dockerStartCmd"][-1]
 

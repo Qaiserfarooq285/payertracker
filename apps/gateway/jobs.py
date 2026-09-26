@@ -9,8 +9,10 @@ additions are the pre-pod statuses and `pod_phase`.
 
 Statuses:
     queued          waiting for the single worker (jobs run one at a time -- one GPU, ~$14 credit)
-    waiting_gpu     RunPod has no GPU right now; the worker retries until one appears
-    starting_gpu    pod being started / created / booting
+    waiting_gpu     the GPU is off (the user has not pressed Start GPU) or RunPod has no card yet.
+                    The worker NEVER starts the GPU itself (2026-09-26): it waits, for free, until
+                    the user does -- or cancels the job
+    starting_gpu    the user's Start is creating / booting the pod
     uploading       pushing the video to the pod
     running         the pod's pipeline is working; stage/progress/logs mirror the pod's
     completed / failed
@@ -34,9 +36,8 @@ from typing import Any
 
 import requests
 
-from apps.gateway import runpod_pods as rp
 from apps.gateway.pod_client import PodClient
-from apps.gateway.pod_manager import ONLINE, PodManager, PodUnavailable
+from apps.gateway.pod_manager import ERROR, ONLINE, WAITING_FOR_GPU, PodManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,12 @@ POD_POLL_S = 2.0
 # mid-job has really died (or RunPod took the host). Give it this long before failing the job.
 POD_UNREACHABLE_GRACE_S = 10 * 60.0
 IDLE_SLEEP_S = 2.0
+POD_WAIT_POLL_S = 2.0
+CANCELLED_STAGE = "Cancelled"
+
+
+class JobCancelled(Exception):
+    """The user cancelled the job (or stopped the GPU under it)."""
 
 
 class JobStore:
@@ -146,9 +153,39 @@ class JobStore:
         with self._lock:
             return any(j["video_name"] == video_name and j["status"] in ACTIVE_STATUSES for j in self._jobs.values())
 
+    def cancel(self, job_id: str, reason: str) -> dict[str, Any] | None:
+        """Mark an active job cancelled; the worker notices on its next poll and lets go. A job
+        already running on the pod is not killed there -- the GPU's idle auto-stop (or the user's
+        Stop GPU) ends that."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job["status"] not in ACTIVE_STATUSES:
+                return None
+            job.update(status=FAILED, stage=CANCELLED_STAGE, cancelled=True, error=reason)
+            job["logs"].append(f"Cancelled: {reason}")
+            job["updated_at"] = job["finished_at"] = time.time()
+            self._save()
+            return dict(job)
+
+    def cancel_active(self, reason: str) -> list[str]:
+        with self._lock:
+            ids = [j["job_id"] for j in self._jobs.values() if j["status"] in ACTIVE_STATUSES]
+            for job_id in ids:
+                self.cancel(job_id, reason)
+            return ids
+
+    def is_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job is None or bool(job.get("cancelled"))
+
     def update(self, job_id: str, **fields: Any) -> dict[str, Any]:
         with self._lock:
             job = self._jobs[job_id]
+            if job.get("cancelled"):
+                # The worker may still be mid-step when the user cancels: never resurrect the job.
+                for key in ("status", "stage", "progress", "error", "logs"):
+                    fields.pop(key, None)
             log = fields.pop("log", None)
             job.update(fields)
             if log:
@@ -200,6 +237,8 @@ class JobWorker:
                 continue
             try:
                 self.run_job(job)
+            except JobCancelled:
+                logger.info("job %s cancelled", job["job_id"])
             except Exception as exc:  # never let one job kill the worker
                 logger.exception("job %s crashed", job["job_id"])
                 self.store.update(job["job_id"], status=FAILED, stage="Failed", error=str(exc), log=f"Gateway error: {exc}")
@@ -213,12 +252,12 @@ class JobWorker:
 
         # A gateway restart mid-run: the pod may still be working on it -- re-attach, don't restart.
         if job["status"] == RUNNING and job.get("pod_job_id"):
-            self._ensure_pod(job_id)  # whatever card it is on: never swap a pod mid-run
+            self._wait_for_pod(job_id)
             self._mirror_until_done(job_id, job["pod_job_id"])
             return
 
-        # 1. GPU pod -- on the card the user picked for this run, when they picked one.
-        self._ensure_pod(job_id, gpu_tier=job.get("gpu_tier"))
+        # 1. The GPU -- switched on by the user's Start GPU, never by the job.
+        self._wait_for_pod(job_id)
 
         # 2. The file. Uploaded to the VPS; the pod's volume may already have it from a past run.
         if local.exists():
@@ -232,6 +271,8 @@ class JobWorker:
                                   log=f"Uploading {video_name} to the GPU pod...")
 
                 def on_upload(frac: float) -> None:
+                    self._check_cancelled(job_id)
+                    self.pods.touch()
                     self.store.update(job_id, stage=f"Uploading video to the GPU pod ({int(frac * 100)}%)")
 
                 self.pod.upload_video(local, upload_id=f"gw{job_id}{uuid.uuid4().hex[:16]}", on_progress=on_upload)
@@ -242,6 +283,7 @@ class JobWorker:
             logger.info("job %s: %s is not on the VPS; relying on the pod's copy", job_id, video_name)
 
         # 3. Start the pipeline on the pod.
+        self._check_cancelled(job_id)
         self.store.update(job_id, status=RUNNING, stage="Starting pipeline", progress=0, log="Starting the pipeline on the GPU pod...")
         started = self.pod.start_process(job["payload"])
         pod_job_id = started.get("job_id")
@@ -252,37 +294,45 @@ class JobWorker:
         # 4. Mirror progress until it ends.
         self._mirror_until_done(job_id, pod_job_id)
 
-    def _ensure_pod(self, job_id: str, gpu_tier: str | None = None) -> None:
-        tier = rp.gpu_tier(gpu_tier)
+    def _check_cancelled(self, job_id: str) -> None:
+        if self.store.is_cancelled(job_id):
+            raise JobCancelled(job_id)
 
-        def on_progress(phase: str, message: str) -> None:
-            status = WAITING_GPU if phase == "waiting_for_gpu" else STARTING_GPU
-            stage = {
-                "waiting_for_gpu": "Waiting for a free GPU",
-                "starting": "Starting the GPU pod",
-                "booting": "GPU pod booting",
-                "online": "GPU pod online",
-                "error": "GPU pod error",
-            }.get(phase, "Preparing the GPU pod")
-            self.store.update(job_id, status=status, stage=stage, progress=0, pod_phase=phase, log=message)
-
-        if self.pods.online:
-            self.pods.refresh()
-        if self.pods.state.phase != ONLINE:
-            on_progress(self.pods.state.phase or "starting", "Checking the GPU pod...")
-        if tier is not None:
-            self.store.update(job_id, log=f"GPU: {tier['label']} tier ({tier['gpu_type_ids'][0]}).")
-        try:
-            self.pods.ensure_online(on_progress, gpu_types=tier["gpu_type_ids"] if tier else None)
-        except PodUnavailable as exc:
-            raise RuntimeError(f"GPU pod unavailable: {exc}") from exc
+    def _wait_for_pod(self, job_id: str) -> None:
+        """Wait -- for free -- until the GPU is online. The job only ever WATCHES the pod; the
+        user's Start GPU is what brings it up (2026-09-26: jobs that started pods themselves are
+        how a queued job kept creating pods for 30 hours)."""
+        last: tuple[str, str, str] | None = None
+        while not self._stop.is_set():
+            self._check_cancelled(job_id)
+            st = self.pods.state
+            if st.phase == ONLINE:
+                break
+            if self.pods.starting or st.wanted:
+                status = WAITING_GPU if st.phase == WAITING_FOR_GPU else STARTING_GPU
+                stage = {
+                    WAITING_FOR_GPU: "Waiting for a free GPU",
+                    "starting": "Starting the GPU",
+                    "booting": "GPU booting",
+                }.get(st.phase, "Starting the GPU")
+                message = st.message
+            else:
+                status, stage = WAITING_GPU, "GPU is off -- press Start GPU"
+                message = ("Waiting for you to press Start GPU (nothing is billed until you do)."
+                           + (f" Last start failed: {st.message}" if st.phase == ERROR else ""))
+            if (status, stage, message) != last:
+                last = (status, stage, message)
+                self.store.update(job_id, status=status, stage=stage, progress=0, pod_phase=st.phase, log=message)
+            self._sleep(POD_WAIT_POLL_S)
+        self._check_cancelled(job_id)
+        self.pods.touch()
         st = self.pods.state
         self.store.update(
             job_id,
             pod_phase=ONLINE,
             gpu_type=st.gpu_type,
             cost_per_hr=st.cost_per_hr,
-            log=f"GPU pod online: {st.gpu_name or st.gpu_type} at ${st.cost_per_hr:.2f}/h.",
+            log=f"GPU online: {st.gpu_name or st.gpu_type} at ${st.cost_per_hr:.2f}/h.",
         )
 
     def _mirror_until_done(self, job_id: str, pod_job_id: str) -> None:
@@ -292,6 +342,8 @@ class JobWorker:
         prefix_logs = [line for line in current.get("logs", []) if not line.startswith("[pod] ")]
         unreachable_since: float | None = None
         while not self._stop.is_set():
+            self._check_cancelled(job_id)
+            self.pods.touch()  # a job in flight is GPU use: no idle auto-stop under it
             try:
                 pod_job = self.pod.job_status(pod_job_id)
                 unreachable_since = None

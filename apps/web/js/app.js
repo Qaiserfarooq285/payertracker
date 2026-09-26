@@ -90,9 +90,11 @@ function initApp() {
   setInterval(checkHealth, HEALTH_POLL_MS);
   loadVideos();
   loadGpuTiers();
+  initGpuPower();
   resumeActiveJob();
 
   document.getElementById('btn-process').addEventListener('click', startPipelineProcessing);
+  document.getElementById('btn-cancel-job')?.addEventListener('click', cancelActiveJob);
   document.getElementById('video-select').addEventListener('change', updatePreviewVideo);
   initClickToTrack();
   initFramePlayersPicker();
@@ -425,16 +427,181 @@ function renderGpuTiers() {
   note.innerHTML = parts.join('<br>');
 }
 
+// ---- GPU power: Start / Stop GPU (2026-09-26) ----
+// The RunPod GPU is switched on ONLY by the Start GPU button (never by a page load, Run, or a
+// results view) and off by Stop GPU or the gateway's idle auto-stop. `gpuPower` mirrors the
+// gateway's /api/pod; a plain pod server has no /api/pod, so the panel stays hidden there and Run
+// behaves as before.
+let gpuPower = null;          // last /api/pod payload, or null when there is no gateway
+let gpuStopping = false;      // Stop pressed, RunPod not yet confirmed
+let gpuPowerTimer = null;
+
+function initGpuPower() {
+  document.getElementById('btn-gpu-start')?.addEventListener('click', startGpu);
+  document.getElementById('btn-gpu-stop')?.addEventListener('click', stopGpu);
+  pollGpuPower();
+}
+
+function scheduleGpuPoll(ms) {
+  clearTimeout(gpuPowerTimer);
+  gpuPowerTimer = setTimeout(pollGpuPower, ms);
+}
+
+async function pollGpuPower() {
+  try {
+    const res = await fetch('/api/pod');
+    if (res.status === 404) { gpuPower = null; updateRunButton(); return; } // plain pod server
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const prevPhase = gpuPower?.pod?.phase;
+    gpuPower = await res.json();
+    const pod = gpuPower.pod;
+    if (prevPhase && prevPhase !== pod.phase) checkHealth(); // keep the header badge in step
+    if (gpuStopping && !pod.billing && !pod.wanted && !gpuPower.starting) gpuStopping = false;
+    renderGpuPower();
+    scheduleGpuPoll(gpuStopping || gpuPower.starting || ['starting', 'booting', 'waiting_for_gpu'].includes(pod.phase) ? 3000 : 10000);
+  } catch (err) {
+    console.warn('GPU state unavailable:', err);
+    scheduleGpuPoll(15000);
+  }
+}
+
+function gpuIsUsable() {
+  // Run is allowed once the GPU is on or on its way (the job then waits for it); never when off.
+  if (!gpuPower) return true; // no gateway: the pod itself answers
+  const pod = gpuPower.pod;
+  return !gpuStopping && (pod.phase === 'online' || gpuPower.starting || pod.wanted);
+}
+
+function fmtMoney(v) { return `$${Number(v).toFixed(2)}`; }
+
+function renderGpuPower() {
+  const box = document.getElementById('gpu-power');
+  if (!box || !gpuPower) return;
+  box.classList.remove('hidden');
+  const pod = gpuPower.pod;
+  const startBtn = document.getElementById('btn-gpu-start');
+  const stopBtn = document.getElementById('btn-gpu-stop');
+  let state = 'off', title = 'GPU is off', detail = pod.message || '';
+  let showStart = true, startLabel = '<i class="fa-solid fa-power-off"></i> Start GPU';
+  let showStop = !!pod.billing, stopLabel = '<i class="fa-solid fa-stop"></i> Stop GPU';
+
+  if (gpuStopping) {
+    state = 'busy'; title = 'Stopping GPU...'; detail = 'Stopping and removing the pod so nothing keeps billing.';
+    showStart = false; showStop = false;
+  } else if (pod.phase === 'online') {
+    state = 'on'; title = 'GPU is on'; showStart = false; showStop = true;
+  } else if (pod.phase === 'waiting_for_gpu') {
+    state = 'waiting'; title = 'Waiting for a free GPU'; showStart = false; showStop = true;
+    stopLabel = '<i class="fa-solid fa-xmark"></i> Cancel start';
+  } else if (gpuPower.starting || pod.wanted || ['starting', 'booting'].includes(pod.phase)) {
+    state = 'busy'; title = pod.phase === 'booting' ? 'GPU booting...' : 'Starting GPU...';
+    showStart = false; showStop = true;
+    stopLabel = '<i class="fa-solid fa-xmark"></i> Cancel start';
+  } else if (pod.phase === 'error') {
+    state = 'error'; title = 'GPU problem';
+    startLabel = '<i class="fa-solid fa-rotate-right"></i> Try again';
+  }
+
+  box.dataset.state = state;
+  document.getElementById('gpu-power-title').textContent = title;
+  document.getElementById('gpu-power-detail').textContent = detail;
+
+  const pills = [];
+  if (pod.billing && pod.cost_per_hr) pills.push(`<span class="meta-pill">${pod.gpu_name || pod.gpu_type.replace('NVIDIA ', '') || 'GPU'} · ${fmtMoney(pod.cost_per_hr)}/h</span>`);
+  if (pod.idle_stop_in_s != null) pills.push(`<span class="meta-pill">Auto-stops in ${Math.max(1, Math.ceil(pod.idle_stop_in_s / 60))} min if idle</span>`);
+  else if (pod.billing && gpuPower.idle_stop_minutes) pills.push(`<span class="meta-pill">Auto-stops after ${Math.round(gpuPower.idle_stop_minutes)} min idle</span>`);
+  if (gpuPower.account) {
+    const bal = gpuPower.account.balance;
+    const cls = bal < 1 ? 'bad' : (bal < 5 ? 'warn' : '');
+    pills.push(`<span class="meta-pill ${cls}">RunPod balance ${fmtMoney(bal)}</span>`);
+    if (gpuPower.account.spend_per_hr >= 0.05) pills.push(`<span class="meta-pill warn">Spending ${fmtMoney(gpuPower.account.spend_per_hr)}/h</span>`);
+  }
+  document.getElementById('gpu-power-meta').innerHTML = pills.join('');
+
+  startBtn.classList.toggle('hidden', !showStart);
+  startBtn.disabled = false;
+  startBtn.innerHTML = startLabel;
+  stopBtn.classList.toggle('hidden', !showStop);
+  stopBtn.disabled = false;
+  stopBtn.innerHTML = stopLabel;
+  updateRunButton();
+}
+
+async function startGpu() {
+  const btn = document.getElementById('btn-gpu-start');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Starting...';
+  try {
+    const res = await fetch('/api/pod/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gpu_tier: selectedGpuTier || null }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    const tier = gpuTierData?.tiers.find(t => t.id === selectedGpuTier);
+    logTerminal(`Starting the GPU${tier ? ` (${tier.label}: ${tier.primary.display_name})` : ''}. Billing runs until you press Stop GPU or it sits idle.`, 'info');
+  } catch (err) {
+    logTerminal(`Could not start the GPU: ${err.message}`, 'error');
+  }
+  pollGpuPower();
+}
+
+async function stopGpu() {
+  if (activeJobId && !confirm('A job is queued or running. Stopping the GPU cancels it. Stop anyway?')) return;
+  gpuStopping = true;
+  renderGpuPower();
+  try {
+    const res = await fetch('/api/pod/stop', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    if (data.cancelled_jobs?.length) logTerminal(`Cancelled ${data.cancelled_jobs.length} job(s) because the GPU was stopped.`, 'warn');
+    logTerminal('Stopping the GPU...', 'info');
+  } catch (err) {
+    gpuStopping = false;
+    logTerminal(`Could not stop the GPU: ${err.message}`, 'error');
+  }
+  pollGpuPower();
+}
+
+async function cancelActiveJob() {
+  if (!activeJobId) return;
+  const btn = document.getElementById('btn-cancel-job');
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/jobs/${activeJobId}/cancel`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    // The next status poll sees `failed` / Cancelled and resets the page.
+  } catch (err) {
+    logTerminal(`Could not cancel: ${err.message}`, 'error');
+  }
+  btn.disabled = false;
+}
+
+// Run follows the GPU: disabled (with the reason) while it is off, unless a job is in flight.
+function updateRunButton() {
+  if (activeJobId) return; // the job owns the button until it ends
+  const btn = document.getElementById('btn-process');
+  if (!btn) return;
+  if (gpuIsUsable()) {
+    btn.disabled = false;
+    btn.innerHTML = `<i class="fa-solid fa-play"></i> Run Player Tracking & Analytics`;
+  } else {
+    btn.disabled = true;
+    btn.innerHTML = `<i class="fa-solid fa-power-off"></i> Start the GPU first`;
+  }
+}
+
 const HEALTH_POLL_MS = 10000;
 // Pod phases as reported by apps/gateway/pod_manager.py -> badge text. A plain (non-gateway)
 // server has no `pod` field and falls through to the old CUDA/CPU labels.
 const POD_PHASE_LABELS = {
   online: { icon: 'fa-microchip', text: (p) => `${p.gpu_name || 'GPU'} (CUDA)`, cls: 'pod-online' },
-  offline: { icon: 'fa-moon', text: () => 'GPU pod asleep -- starts when you press Run', cls: 'pod-offline' },
+  offline: { icon: 'fa-power-off', text: () => 'GPU off -- press Start GPU', cls: 'pod-offline' },
   starting: { icon: 'fa-spinner fa-spin', text: () => 'GPU pod starting...', cls: 'pod-busy' },
   booting: { icon: 'fa-spinner fa-spin', text: () => 'GPU pod booting...', cls: 'pod-busy' },
-  waiting_for_gpu: { icon: 'fa-hourglass-half', text: () => 'No GPU available right now -- waiting for one', cls: 'pod-waiting' },
-  error: { icon: 'fa-triangle-exclamation', text: (p) => `GPU pod error: ${p.message}`, cls: 'pod-error' },
+  waiting_for_gpu: { icon: 'fa-hourglass-half', text: () => 'Waiting for a free GPU', cls: 'pod-waiting' },
+  error: { icon: 'fa-triangle-exclamation', text: () => 'GPU problem -- see the GPU panel', cls: 'pod-error' },
   unknown: { icon: 'fa-question', text: () => 'Checking GPU pod...', cls: 'pod-offline' },
 };
 
@@ -476,6 +643,7 @@ async function resumeActiveJob() {
     document.getElementById('btn-process').disabled = true;
     document.getElementById('btn-process').innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Processing Video...`;
     activeJobId = job.job_id;
+    document.getElementById('btn-cancel-job')?.classList.remove('hidden');
     startJobPolling(activeJobId);
   } catch (err) {
     console.warn('Could not check for active jobs:', err);
@@ -671,6 +839,7 @@ async function startPipelineProcessing() {
     }
     logTerminal(data.message || `Job ${data.job_id} queued.`, 'info');
     activeJobId = data.job_id;
+    document.getElementById('btn-cancel-job')?.classList.remove('hidden');
     startJobPolling(activeJobId);
   } catch (err) {
     logTerminal(`Error launching pipeline: ${err.message}`, 'error');
@@ -689,19 +858,20 @@ async function checkJobStatus(jobId) {
     const job = await res.json();
 
     updateProgressBar(job.progress, job.stage);
-    document.getElementById('job-status-badge').textContent = job.status.replace(/_/g, ' ').toUpperCase();
+    document.getElementById('job-status-badge').textContent =
+      job.stage === 'Cancelled' ? 'CANCELLED' : job.status.replace(/_/g, ' ').toUpperCase();
 
     // Highlight flow diagram node based on stage
     highlightFlowStage(job.stage);
 
     if (job.logs && job.logs.length > 0) {
-      const lastLog = job.logs[job.logs.length - 1];
-      // The gateway repeats the last line on every poll; only print it when it changes.
-      if (lastLog !== lastLoggedLine) {
-        lastLoggedLine = lastLog;
-        const kind = job.status === 'failed' ? 'error' : (job.status === 'waiting_gpu' ? 'warn' : 'info');
-        logTerminal(lastLog, kind);
-      }
+      // Print every line added since the last poll (a long run logs several per second), not
+      // just the newest one. Lines carry timestamps, so the last one printed is a safe anchor.
+      const seen = lastLoggedLine === null ? -1 : job.logs.lastIndexOf(lastLoggedLine);
+      const fresh = seen >= 0 ? job.logs.slice(seen + 1) : job.logs.slice(-5);
+      const kind = job.status === 'failed' ? 'error' : (job.status === 'waiting_gpu' ? 'warn' : 'info');
+      fresh.forEach(line => logTerminal(line, kind));
+      if (fresh.length) lastLoggedLine = job.logs[job.logs.length - 1];
     }
 
     if (job.status === 'completed') {
@@ -711,7 +881,7 @@ async function checkJobStatus(jobId) {
       loadResults(job.slug || jobId);
     } else if (job.status === 'failed') {
       clearInterval(pollingTimer);
-      logTerminal(`Job failed: ${job.error}`, 'error');
+      logTerminal(job.stage === 'Cancelled' ? `Job cancelled (${job.error}).` : `Job failed: ${job.error}`, job.stage === 'Cancelled' ? 'warn' : 'error');
       resetProcessBtn();
     }
   } catch (err) {
@@ -741,9 +911,9 @@ function updateProgressBar(percent, stageText) {
 }
 
 function resetProcessBtn() {
-  const btn = document.getElementById('btn-process');
-  btn.disabled = false;
-  btn.innerHTML = `<i class="fa-solid fa-play"></i> Run Player Tracking & Analytics`;
+  activeJobId = null;
+  document.getElementById('btn-cancel-job')?.classList.add('hidden');
+  updateRunButton();
 }
 
 function logTerminal(msg, type = 'info') {

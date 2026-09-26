@@ -32,8 +32,7 @@ def gw(tmp_path, monkeypatch):
     import apps.gateway.main as main
 
     main = importlib.reload(main)
-    main.PODS.state = pm.PodState(phase=pm.OFFLINE, message="GPU pod is stopped")
-    main.request_wake = lambda: None  # never spawn the real wake thread in tests
+    main.PODS.state = pm.PodState(phase=pm.OFFLINE, message="GPU is off")
     with TestClient(main.app) as client:
         yield client, main
 
@@ -70,6 +69,7 @@ def test_frontend_and_uploads_work_with_pod_offline(gw, tmp_path):
 def test_run_queues_and_status_explains_waiting(gw):
     client, main = gw
     _upload(client, "a.mp4", b"xx")
+    main.PODS.state.wanted = True  # the user pressed Start GPU; it is still coming up
     res = client.post("/api/process", json={"video_name": "a.mp4", "target_jersey": 7})
     assert res.status_code == 200, res.text
     job_id = res.json()["job_id"]
@@ -88,7 +88,7 @@ def test_gpu_only_endpoints_say_why_when_pod_is_down(gw):
     main.PODS.state = pm.PodState(phase=pm.WAITING_FOR_GPU, message="No GPU available on RunPod right now")
     res = client.get("/api/frame_players?video=a.mp4&t=1")
     assert res.status_code == 503
-    assert "No GPU available" in res.json()["detail"]
+    assert "No GPU free" in res.json()["detail"]
     assert client.get("/api/results/some_slug").status_code == 503
     assert client.get("/media/output/x/y.mp4").status_code == 503
     # /api/health stays public and cheap, and carries the phase for the badge.
@@ -143,25 +143,45 @@ class FakePodClient:
 
 
 class FakePods:
-    def __init__(self, phases_before_online=()):
-        self.state = pm.PodState(phase=pm.OFFLINE)
-        self.phases = list(phases_before_online)
+    """The PodManager surface the worker uses. `script` is the phases the user's Start walks
+    through, one per poll, before the GPU is online; `wanted=False` = nobody pressed Start."""
+
+    def __init__(self, script=(), wanted=True):
+        self._script = list(script)
+        self._state = pm.PodState(phase=pm.OFFLINE, wanted=wanted)
+        self.touched = 0
+        self.start_calls = 0
+
+    @property
+    def state(self):
+        if self._state.wanted and self._state.phase != pm.ONLINE:
+            if self._script:
+                phase, msg = self._script.pop(0)
+                self._state = pm.PodState(phase=phase, message=msg, wanted=True)
+            else:
+                self._state = pm.PodState(phase=pm.ONLINE, proxy_url="https://pod", gpu_name="RTX 4090",
+                                          wanted=True, billing=True)
+        return self._state
+
+    @property
+    def starting(self):
+        return False
 
     @property
     def online(self):
-        return self.state.phase == pm.ONLINE
+        return self._state.phase == pm.ONLINE
+
+    def touch(self):
+        self.touched += 1
 
     def refresh(self):
-        return self.state
+        return self._state
 
-    def ensure_online(self, on_progress=lambda *a: None, deadline_s=None, gpu_types=None):
-        self.gpu_types_asked = gpu_types
-        for phase, msg in self.phases:
-            self.state.phase = phase
-            on_progress(phase, msg)
-        self.state = pm.PodState(phase=pm.ONLINE, proxy_url="https://pod", gpu_name="RTX 4090")
-        on_progress(pm.ONLINE, "GPU pod online")
-        return self.state
+    def ensure_online(self, *a, **k):  # pragma: no cover - the worker must never call this
+        raise AssertionError("the job worker must never start the GPU itself")
+
+    def start(self, *a, **k):  # pragma: no cover
+        raise AssertionError("the job worker must never start the GPU itself")
 
 
 def _worker(tmp_path, pod, pods):
@@ -178,7 +198,7 @@ def test_worker_waits_for_gpu_then_uploads_then_mirrors_pod_progress(tmp_path):
         {"status": "running", "stage": "Tracking", "progress": 60, "logs": ["detecting", "tracking"]},
         {"status": "completed", "stage": "Finished", "progress": 100, "slug": "a", "logs": ["detecting", "tracking", "done"]},
     ])
-    pods = FakePods([(pm.WAITING_FOR_GPU, "No GPU available on RunPod right now -- waiting"),
+    pods = FakePods([(pm.WAITING_FOR_GPU, "No GPU of this tier free on RunPod right now"),
                      (pm.STARTING, "GPU pod created"), (pm.BOOTING, "app starting")])
     store, worker = _worker(tmp_path, pod, pods)
     job = store.create("a.mp4", {"video_name": "a.mp4", "target_jersey": 9})
@@ -190,7 +210,8 @@ def test_worker_waits_for_gpu_then_uploads_then_mirrors_pod_progress(tmp_path):
     assert pod.uploaded == ["a.mp4"]
     assert pod.process_payloads == [{"video_name": "a.mp4", "target_jersey": 9}]
     logs = final["logs"]
-    assert any("No GPU available" in line for line in logs)
+    assert any("No GPU of this tier free" in line for line in logs)
+    assert pods.touched  # job activity keeps the idle auto-stop away
     assert logs[-3:] == ["[pod] detecting", "[pod] tracking", "[pod] done"]
     # Persisted: a fresh store from the same file sees the finished job.
     assert JobStore(tmp_path / "jobs.json").get(job["job_id"])["status"] == "completed"
@@ -304,6 +325,7 @@ def test_gpus_endpoint_survives_a_failed_price_lookup(gw, monkeypatch):
 def test_process_rejects_an_unknown_gpu_tier_and_keeps_a_known_one(gw):
     client, main = gw
     _upload(client, "g.mp4", b"xx")
+    main.PODS.state.wanted = True
     bad = client.post("/api/process", json={"video_name": "g.mp4", "gpu_tier": "quantum"})
     assert bad.status_code == 400
     ok = client.post(
@@ -318,21 +340,139 @@ def test_process_rejects_an_unknown_gpu_tier_and_keeps_a_known_one(gw):
 DONE = {"status": "completed", "stage": "Finished", "progress": 100, "slug": "a", "logs": []}
 
 
-def test_worker_wakes_the_pod_on_the_picked_gpu_tier_and_forwards_a_clean_payload(tmp_path):
+def test_worker_forwards_a_clean_payload_and_keeps_the_tier_for_display(tmp_path):
     pod = FakePodClient([DONE], has_video=True)
-    pods = FakePods()
-    store, worker = _worker(tmp_path, pod, pods)
+    store, worker = _worker(tmp_path, pod, FakePods())
     job = store.create("a.mp4", {"video_name": "a.mp4", "gpu_tier": "budget", "target_jersey": 9})
     worker.run_job(job)
-    assert pods.gpu_types_asked == main_rp.gpu_tier("budget")["gpu_type_ids"]
     assert pod.process_payloads[-1] == {"video_name": "a.mp4", "target_jersey": 9}
     final = store.get(job["job_id"])
     assert final["status"] == "completed" and final["gpu_tier"] == "budget"
 
 
-def test_worker_without_a_tier_asks_for_the_default(tmp_path):
+# ---------------------------------------------------------------------------
+# User-controlled GPU (2026-09-26)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_waits_for_the_users_start_and_never_starts_the_gpu(tmp_path):
+    """The Trim_.mp4 case: a queued job must wait -- for free -- rather than create pods."""
     pod = FakePodClient([DONE], has_video=True)
-    pods = FakePods()
-    store, worker = _worker(tmp_path, pod, pods)
-    worker.run_job(store.create("a.mp4", {"video_name": "a.mp4"}))
-    assert pods.gpu_types_asked is None
+    pods = FakePods(wanted=False)
+    store = JobStore(tmp_path / "jobs.json")
+    (tmp_path / "input").mkdir()
+    (tmp_path / "input" / "a.mp4").write_bytes(b"v")
+    job = store.create("a.mp4", {"video_name": "a.mp4"})
+    polls = {"n": 0}
+
+    def sleep(_s):
+        polls["n"] += 1
+        if polls["n"] == 3:
+            st = store.get(job["job_id"])
+            assert st["status"] == jobs_mod.WAITING_GPU and "Start GPU" in st["stage"]
+            store.cancel(job["job_id"], "cancelled by you")
+
+    worker = JobWorker(store, pods, pod, tmp_path / "input", sleep=sleep, clock=lambda: 0.0)
+    with pytest.raises(jobs_mod.JobCancelled):
+        worker.run_job(job)
+    final = store.get(job["job_id"])
+    assert final["status"] == "failed" and final["stage"] == "Cancelled"
+    assert pod.process_payloads == []
+
+
+def test_cancel_is_final_even_if_the_worker_writes_after_it(tmp_path):
+    store = JobStore(tmp_path / "jobs.json")
+    job = store.create("a.mp4", {"video_name": "a.mp4"})
+    assert store.cancel(job["job_id"], "cancelled by you")["status"] == "failed"
+    store.update(job["job_id"], status=jobs_mod.RUNNING, stage="Detection", progress=40, log="late line")
+    st = store.get(job["job_id"])
+    assert st["status"] == "failed" and st["stage"] == "Cancelled" and st["progress"] == 0
+    assert store.cancel(job["job_id"], "again") is None  # not active any more
+    assert store.next_queued() is None
+
+
+def test_run_is_refused_while_the_gpu_is_off(gw):
+    client, main = gw
+    _upload(client, "b.mp4", b"xx")
+    res = client.post("/api/process", json={"video_name": "b.mp4"})
+    assert res.status_code == 409 and "Start GPU" in res.json()["detail"]
+    assert client.get("/api/jobs").json()["active"] == []
+
+
+def test_gpu_endpoints_never_wake_the_pod(gw, monkeypatch):
+    client, main = gw
+    monkeypatch.setattr(main.PODS, "start", lambda *a, **k: pytest.fail("a view started the GPU"))
+    monkeypatch.setattr(main.PODS, "ensure_online", lambda *a, **k: pytest.fail("a view started the GPU"))
+    res = client.get("/api/results/some_slug")
+    assert res.status_code == 503 and "press Start GPU" in res.json()["detail"]
+    assert client.get("/media/output/x/y.mp4").status_code == 503
+    assert client.get("/api/frame_players?video=a.mp4&t=1").status_code == 503
+    assert client.post("/api/pod/wake").status_code in (404, 405)  # the old auto-wake is gone
+
+
+def test_start_and_stop_endpoints(gw, monkeypatch):
+    client, main = gw
+    started = []
+    monkeypatch.setattr(main.PODS, "start", lambda gpu_types=None: started.append(gpu_types) or True)
+    assert client.post("/api/pod/start", json={"gpu_tier": "quantum"}).status_code == 400
+    res = client.post("/api/pod/start", json={"gpu_tier": "budget"})
+    assert res.status_code == 200 and res.json()["status"] == "starting"
+    assert started == [main_rp.gpu_tier("budget")["gpu_type_ids"]]
+
+    _upload(client, "c.mp4", b"xx")
+    main.PODS.state.wanted = True
+    job_id = client.post("/api/process", json={"video_name": "c.mp4"}).json()["job_id"]
+    stops = []
+    monkeypatch.setattr(main.PODS, "stop", lambda *a, **k: stops.append(a))
+    res = client.post("/api/pod/stop")
+    assert res.status_code == 200 and res.json()["cancelled_jobs"] == [job_id]
+    assert client.get(f"/api/status/{job_id}").json()["stage"] == "Cancelled"
+    assert main.PODS.state.wanted is False
+    import time as _t
+
+    for _ in range(50):
+        if stops:
+            break
+        _t.sleep(0.02)
+    assert stops, "Stop GPU must stop the pod"
+
+
+def test_cancel_endpoint(gw):
+    client, main = gw
+    _upload(client, "d.mp4", b"xx")
+    main.PODS.state.wanted = True
+    job_id = client.post("/api/process", json={"video_name": "d.mp4"}).json()["job_id"]
+    res = client.post(f"/api/jobs/{job_id}/cancel")
+    assert res.status_code == 200 and res.json()["status"] == "failed"
+    assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 409
+
+
+def test_pod_state_carries_balance_and_idle_settings(gw, monkeypatch):
+    client, main = gw
+    monkeypatch.setattr(main.rp, "fetch_account", lambda key: {"balance": 12.5, "spend_per_hr": 0.004})
+    main._ACCOUNT.update(at=0.0, data=None, error="")
+    data = client.get("/api/pod").json()
+    assert data["account"] == {"balance": 12.5, "spend_per_hr": 0.004}
+    assert data["idle_stop_minutes"] == 10 and data["starting"] is False
+    assert data["pod"]["wanted"] is False and data["pod"]["billing"] is False
+
+
+def test_pods_fetch_code_with_the_key_only(gw):
+    client, main = gw
+    assert client.get("/pod/bootstrap.sh").status_code == 403
+    assert client.get("/pod/code.tar.gz", headers={"X-PV-Pod-Key": "nope"}).status_code == 403
+    key = {"X-PV-Pod-Key": main.pod_bootstrap_key()}
+    boot = client.get("/pod/bootstrap.sh", headers=key)
+    assert boot.status_code == 200 and "PV_GATEWAY_URL" in boot.text
+    code = client.get("/pod/code.tar.gz", headers=key)
+    assert code.status_code == 200 and code.content[:2] == b"\x1f\x8b"  # gzip
+    assert len(code.headers["x-pv-commit"]) == 12
+
+
+def test_pod_create_body_uses_the_gateway_when_configured():
+    env = {"PV_GATEWAY_URL": "https://gw", "PV_POD_KEY": "k"}
+    body = main_rp.pod_create_body(name="p", gpu_type_ids=["x"], volume_id="v", env=env)
+    cmd = body["dockerStartCmd"][-1]
+    assert "$PV_GATEWAY_URL/pod/bootstrap.sh" in cmd and "GITHUB_TOKEN" not in cmd
+    legacy = main_rp.pod_create_body(name="p", gpu_type_ids=["x"], volume_id="v", env={})
+    assert "raw.githubusercontent.com" in legacy["dockerStartCmd"][-1]

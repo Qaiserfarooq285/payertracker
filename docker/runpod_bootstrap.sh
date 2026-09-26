@@ -21,6 +21,9 @@
 #   CLOUDFLARE_TUNNEL_TOKEN  (optional) token from Cloudflare Zero Trust -> your own domain
 #   GEMINI_API_KEY           (optional) same meaning as in .env.example
 #   PORT                     listen port, default 8000 (expose the same port as HTTP on the pod)
+#   PV_GATEWAY_URL / PV_POD_KEY  set by the VPS gateway (2026-09-26): fetch this script AND the
+#                            code from the gateway's own checkout instead of GitHub -- no token that
+#                            can expire. When both are set, GITHUB_TOKEN is not needed at all.
 #   GITHUB_TOKEN             read-only fine-grained PAT for the private repo (clone + fetch)
 #   PV_BRANCH / PV_REPO_URL  which code to run, default master of the repo
 #   PV_AUTO_UPDATE=0         keep whatever checkout is on the volume; default 1 = fast-forward
@@ -56,25 +59,46 @@ if [ "$need_apt" = "1" ]; then
 fi
 
 # --- code -----------------------------------------------------------------------------------
-# The token rides on a per-command header, never in the remote URL, so it is not written into
-# .git/config on the volume and rotating it is just a pod env change.
-GIT_AUTH=()
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-  GIT_AUTH=(-c "http.https://github.com/.extraheader=Authorization: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)")
-else
-  log "GITHUB_TOKEN is not set -- clone/fetch will only work while the repo is public"
-fi
 mkdir -p "$WS"
-if [ ! -d "$APP/.git" ]; then
-  log "cloning $REPO_URL ($BRANCH) -> $APP"
-  git "${GIT_AUTH[@]}" clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP"
-elif [ "${PV_AUTO_UPDATE:-1}" = "1" ]; then
-  log "updating checkout to origin/$BRANCH"
-  git "${GIT_AUTH[@]}" -C "$APP" fetch --quiet origin "$BRANCH"
-  git -C "$APP" reset --hard --quiet "origin/$BRANCH"
+if [ -n "${PV_GATEWAY_URL:-}" ] && [ -n "${PV_POD_KEY:-}" ]; then
+  # From the gateway: a tarball of exactly what the VPS runs. `.pv-manifest` remembers the files
+  # the last tarball brought, so a file deleted from the repo is deleted here too; everything else
+  # on the volume (.venv, models/, input/, work/, output/) is left alone.
+  log "fetching code from the gateway ($PV_GATEWAY_URL)"
+  mkdir -p "$APP"
+  CODE_TGZ="$(mktemp)"; CODE_HDR="$(mktemp)"; NEW_MANIFEST="$(mktemp)"
+  curl -fsSL --retry 5 --retry-delay 5 -H "X-PV-Pod-Key: $PV_POD_KEY" -D "$CODE_HDR" \
+    -o "$CODE_TGZ" "$PV_GATEWAY_URL/pod/code.tar.gz"
+  tar -tzf "$CODE_TGZ" | grep -v '/$' | sort >"$NEW_MANIFEST"
+  if [ -f "$APP/.pv-manifest" ]; then
+    comm -23 "$APP/.pv-manifest" "$NEW_MANIFEST" | while IFS= read -r gone; do rm -f "$APP/$gone"; done
+  fi
+  tar -xzf "$CODE_TGZ" -C "$APP"
+  mv "$NEW_MANIFEST" "$APP/.pv-manifest"
+  COMMIT="$(tr -d '\r' <"$CODE_HDR" | sed -n 's/^[Xx]-[Pp][Vv]-[Cc]ommit: *//p' | tail -n1)"
+  rm -f "$CODE_TGZ" "$CODE_HDR"
+  cd "$APP"
+  log "running ${COMMIT:-unknown} (from the gateway)"
+else
+  # The token rides on a per-command header, never in the remote URL, so it is not written into
+  # .git/config on the volume and rotating it is just a pod env change.
+  GIT_AUTH=()
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    GIT_AUTH=(-c "http.https://github.com/.extraheader=Authorization: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)")
+  else
+    log "GITHUB_TOKEN is not set -- clone/fetch will only work while the repo is public"
+  fi
+  if [ ! -d "$APP/.git" ]; then
+    log "cloning $REPO_URL ($BRANCH) -> $APP"
+    git "${GIT_AUTH[@]}" clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP"
+  elif [ "${PV_AUTO_UPDATE:-1}" = "1" ]; then
+    log "updating checkout to origin/$BRANCH"
+    git "${GIT_AUTH[@]}" -C "$APP" fetch --quiet origin "$BRANCH"
+    git -C "$APP" reset --hard --quiet "origin/$BRANCH"
+  fi
+  cd "$APP"
+  log "running $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
 fi
-cd "$APP"
-log "running $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
 
 # --- python env (on the volume, so it persists) ----------------------------------------------
 export PATH="$HOME/.local/bin:$PATH"

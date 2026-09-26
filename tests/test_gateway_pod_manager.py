@@ -56,6 +56,11 @@ class FakeRunPod:
         self.calls.append(f"terminate:{pod_id}")
         self.pods.pop(pod_id, None)
 
+    def stop_pod(self, pod_id):
+        self.calls.append(f"stop:{pod_id}")
+        if pod_id in self.pods:
+            self.pods[pod_id]["desiredStatus"] = "EXITED"
+
     def create_pod(self, body):
         self.calls.append("create")
         if not self.create_ok:
@@ -110,6 +115,8 @@ def make(monkeypatch):
         clock = FakeClock()
         config = PodConfig(pod_env={"GITHUB_TOKEN": "t", "PV_ACCESS_PASSWORD": "p"}, poll_s=10, retry_s=60, **cfg)
         mgr = PodManager(fake, config, clock=clock, sleep=clock.sleep)  # type: ignore[arg-type]
+        # What Start GPU does before it calls ensure_online (tests drive ensure_online directly).
+        mgr.state.wanted = True
         return mgr, clock
 
     return _make
@@ -186,7 +193,7 @@ def test_no_gpu_anywhere_waits_and_retries_until_stock_appears(make):
     st = mgr.ensure_online(on_progress)
     assert st.phase == pm.ONLINE
     waiting = [m for ph, m in seen if ph == pm.WAITING_FOR_GPU]
-    assert waiting and "No GPU available" in waiting[0]
+    assert waiting and "No GPU of this tier free" in waiting[0]
     # It kept the user informed AND slept the retry interval between attempts, never spun.
     assert clock.slept.count(60) >= 3
     assert any("waiting" in m and "min" in m for m in waiting[1:])
@@ -224,24 +231,24 @@ def test_running_pod_waits_for_app_to_boot(make):
     assert "start:run1" not in fake.calls and "create" not in fake.calls
 
 
-def test_boot_that_never_comes_up_is_replaced(make):
+def test_boot_that_never_comes_up_is_shut_down_not_recreated(make):
+    """2026-09-24: an expired token made every new pod die at boot, and replacing them in a loop
+    billed ~13 GPU-hours. A pod that misses the boot cap is stopped + terminated, the user is
+    told, and NOTHING new is created."""
     running = {"id": "stuck", "name": "pitchvision", "desiredStatus": "RUNNING", "gpuCount": 1,
                "machine": {"gpuTypeId": "NVIDIA L4"}, "runtime": {"uptimeInSeconds": 0}}
-    fake = FakeRunPod([running])
+    fake = FakeRunPod([running], healthy_after_polls=10**9)
     mgr, clock = make(fake, boot_cap_s=120)
-
-    real_probe = fake.probe
-
-    def probe(url, session=None, timeout_s=None):
-        # The replacement pod boots fine; only "stuck" never answers.
-        if "stuck" in url:
-            return None
-        return real_probe(url, session, timeout_s)
-
-    pm.rp.probe_health = probe
-    st = mgr.ensure_online()
-    assert st.phase == pm.ONLINE and st.pod_id == "new1"
-    assert "terminate:stuck" in fake.calls
+    with pytest.raises(PodUnavailable):
+        mgr.ensure_online()
+    assert mgr.state.phase == pm.ERROR and "did not finish starting" in mgr.state.message
+    assert "stop:stuck" in fake.calls and "terminate:stuck" in fake.calls
+    assert "create" not in fake.calls
+    assert mgr.state.wanted is False and mgr.state.billing is False
+    # and it stays off: a later call without a new Start is refused outright
+    with pytest.raises(PodUnavailable):
+        mgr.ensure_online()
+    assert "create" not in fake.calls
 
 
 def test_refresh_reports_without_acting(make):
@@ -251,7 +258,8 @@ def test_refresh_reports_without_acting(make):
     assert st.phase == pm.OFFLINE
     assert st.pod_id == "old1"
     assert not any(c.startswith(("start", "create", "terminate")) for c in fake.calls)
-    assert st.public() == {"phase": "offline", "message": st.message, "gpu_name": ""}
+    assert st.public() == {"phase": "offline", "message": st.message, "gpu_name": "",
+                           "wanted": True, "billing": False}
 
 
 # ---------------------------------------------------------------------------
@@ -297,3 +305,123 @@ def test_gpu_pick_is_used_when_creating_from_nothing(make):
     st = mgr.ensure_online(gpu_types=BUDGET)
     assert st.phase == pm.ONLINE
     assert tuple(fake.created_bodies[-1]["gpuTypeIds"]) == BUDGET
+
+
+# ---------------------------------------------------------------------------
+# User-controlled GPU (2026-09-26): only Start GPU starts it; Stop / idle / failures stop it
+# ---------------------------------------------------------------------------
+
+
+def test_nothing_starts_the_gpu_unless_the_user_pressed_start(make):
+    fake = FakeRunPod([dict(STOPPED_POD)])
+    mgr, clock = make(fake)
+    mgr.state.wanted = False
+    with pytest.raises(PodUnavailable):
+        mgr.ensure_online()
+    mgr.refresh()
+    assert not any(c.startswith(("start", "create")) for c in fake.calls)
+    assert mgr.state.phase == pm.OFFLINE and "Start GPU" in mgr.state.message
+
+
+def test_low_balance_is_an_error_not_a_wait(make):
+    class Broke(FakeRunPod):
+        def create_pod(self, body):
+            self.calls.append("create")
+            raise RunPodError('POST /pods -> HTTP 500: {"error":"create pod: Your account balance is '
+                              'too low to rent a pod. Please add funds to your account."}', 500)
+
+    fake = Broke([])
+    mgr, clock = make(fake)
+    with pytest.raises(PodUnavailable):
+        mgr.ensure_online()
+    assert mgr.state.phase == pm.ERROR and "balance is too low" in mgr.state.message
+    assert fake.calls.count("create") == 1 and clock.slept == []
+    assert mgr.state.wanted is False
+    # the reason stays on screen through the poller's refreshes
+    mgr.refresh()
+    assert mgr.state.phase == pm.ERROR
+
+
+def test_waiting_for_a_gpu_gives_up_after_the_cap(make):
+    fake = FakeRunPod([], create_ok=False)
+    mgr, clock = make(fake, max_gpu_wait_s=300)
+    with pytest.raises(PodUnavailable):
+        mgr.ensure_online()
+    assert mgr.state.phase == pm.OFFLINE and "gave up" in mgr.state.message
+    assert fake.calls.count("create") <= 7  # ~every 60 s for 5 min, then stop asking
+    assert mgr.state.wanted is False
+
+
+def test_stop_stops_and_terminates_a_running_pod(make):
+    running = {"id": "run1", "name": "pitchvision", "desiredStatus": "RUNNING", "gpuCount": 1,
+               "machine": {"gpuTypeId": "NVIDIA GeForce RTX 4090"}, "runtime": {"uptimeInSeconds": 50}}
+    fake = FakeRunPod([running])
+    mgr, clock = make(fake)
+    mgr.ensure_online()
+    assert mgr.state.billing is True
+    st = mgr.stop()
+    assert st.phase == pm.OFFLINE and st.billing is False and st.wanted is False
+    assert "stop:run1" in fake.calls and "terminate:run1" in fake.calls
+    assert "run1" not in fake.pods
+
+
+def test_stop_reports_a_pod_runpod_refuses_to_stop(make):
+    class Locked(FakeRunPod):
+        def stop_pod(self, pod_id):
+            self.calls.append(f"stop:{pod_id}")
+            raise RunPodError("POST /pods/x/stop -> HTTP 500: Pod is locked", 500)
+
+        def terminate_pod(self, pod_id):
+            self.calls.append(f"terminate:{pod_id}")
+            raise RunPodError('DELETE /pods/x -> HTTP 500: {"error":"delete pod: Pod is locked"}', 500)
+
+    running = {"id": "lk", "name": "pitchvision", "desiredStatus": "RUNNING", "gpuCount": 1,
+               "machine": {"gpuTypeId": "NVIDIA GeForce RTX 4090"}}
+    mgr, clock = make(Locked([running]))
+    st = mgr.stop()
+    assert st.phase == pm.ERROR and "still billing" in st.message and st.billing is True
+
+
+def test_idle_check_stops_an_unused_billing_pod_only(make):
+    running = {"id": "run1", "name": "pitchvision", "desiredStatus": "RUNNING", "gpuCount": 1,
+               "machine": {"gpuTypeId": "NVIDIA GeForce RTX 4090"}, "runtime": {"uptimeInSeconds": 50}}
+    fake = FakeRunPod([running])
+    mgr, clock = make(fake)
+    mgr.refresh()
+    assert mgr.state.billing is True
+    # a job keeps it alive however long it runs
+    clock.now += 3600
+    assert mgr.idle_check(600, busy=True) is None and "run1" in fake.pods
+    # after the job: counts down from the last use, then stops
+    clock.now += 300
+    left = mgr.idle_check(600, busy=False)
+    assert left == pytest.approx(300)
+    assert mgr.state.idle_stop_in_s == pytest.approx(300)
+    clock.now += 301
+    assert mgr.idle_check(600, busy=False) == 0.0
+    assert "run1" not in fake.pods and mgr.state.phase == pm.OFFLINE
+    assert "auto-stopped" in mgr.state.message
+    # nothing billing -> nothing to count
+    assert mgr.idle_check(600, busy=False) is None
+
+
+def test_start_runs_on_a_thread_and_cannot_double_start(make):
+    import threading
+
+    gate = threading.Event()
+    fake = FakeRunPod([])
+    mgr, clock = make(fake)
+    mgr.state.wanted = False
+    real_create = fake.create_pod
+
+    def slow_create(body):
+        gate.wait(5)
+        return real_create(body)
+
+    fake.create_pod = slow_create
+    assert mgr.start() is True
+    assert mgr.state.wanted is True and mgr.starting
+    assert mgr.start() is False  # second press while the first is still working
+    gate.set()
+    mgr._start_thread.join(5)
+    assert mgr.state.phase == pm.ONLINE

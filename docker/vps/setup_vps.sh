@@ -8,8 +8,10 @@
 #     bash setup_vps.sh
 #
 #   DOMAIN               the hostname whose A record points at this VPS (required)
-#   GITHUB_TOKEN         read-only PAT for the private repo (required on first run; the gateway
-#                        also hands it to the pod)
+#   PV_CODE_BUNDLE       path to a `git bundle` of the branch (docker/deploy_vps.sh ships one from
+#                        the owner's Mac, 2026-09-26) -- the code then never comes from GitHub here
+#   GITHUB_TOKEN         read-only PAT for the private repo -- only needed without PV_CODE_BUNDLE
+#                        (pods no longer use it: they fetch their code from this gateway)
 #   RUNPOD_API_KEY       pods read/write (required on first run)
 #   PV_ACCESS_PASSWORD   the site login (required on first run)
 #   EMAIL                Let's Encrypt expiry notices (optional)
@@ -61,24 +63,41 @@ PY
   fi
 }
 for name in GITHUB_TOKEN RUNPOD_API_KEY PV_ACCESS_PASSWORD PV_POD_SSH_PUBLIC_KEY GEMINI_API_KEY \
-            PV_GPU_TYPES PV_DATACENTER PV_POD_NAME PV_VOLUME_NAME PV_IDLE_STOP_MINUTES; do
+            PV_GPU_TYPES PV_DATACENTER PV_POD_NAME PV_VOLUME_NAME PV_IDLE_STOP_MINUTES \
+            PV_GPU_IDLE_MINUTES; do
   if [ -n "${!name:-}" ]; then set_env "$name" "${!name}"; fi
 done
 grep -q '^PV_GATEWAY_DATA=' "$ENV_FILE" || set_env PV_GATEWAY_DATA "$DATA_DIR"
-for required in GITHUB_TOKEN RUNPOD_API_KEY PV_ACCESS_PASSWORD; do
+# Pods fetch their code from this gateway's public URL (apps/gateway/main.py `/pod/*`).
+set_env PV_PUBLIC_URL "https://$DOMAIN"
+for required in RUNPOD_API_KEY PV_ACCESS_PASSWORD; do
   grep -q "^${required}=." "$ENV_FILE" || { log "$required is not set (pass it on the command line)"; exit 1; }
 done
-TOKEN="$(sed -n 's/^GITHUB_TOKEN=//p' "$ENV_FILE")"
 
-# --- code (private repo: token rides on a per-command header, never in .git/config) ----------
-GIT_AUTH=(-c "http.https://github.com/.extraheader=Authorization: Basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)")
-if [ ! -d "$APP/.git" ]; then
-  log "cloning $REPO_URL ($BRANCH) -> $APP"
-  git "${GIT_AUTH[@]}" clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP"
+# --- code --------------------------------------------------------------------------------------
+if [ -n "${PV_CODE_BUNDLE:-}" ] && [ -f "$PV_CODE_BUNDLE" ]; then
+  # Shipped from the owner's Mac -- no GitHub credentials needed on this machine.
+  if [ ! -d "$APP/.git" ]; then
+    log "cloning from the shipped bundle -> $APP"
+    git clone --quiet --branch "$BRANCH" "$PV_CODE_BUNDLE" "$APP"
+  else
+    log "updating $APP from the shipped bundle"
+    git -C "$APP" fetch --quiet "$PV_CODE_BUNDLE" "$BRANCH"
+    git -C "$APP" reset --hard --quiet FETCH_HEAD
+  fi
 else
-  log "updating $APP to origin/$BRANCH"
-  git "${GIT_AUTH[@]}" -C "$APP" fetch --quiet origin "$BRANCH"
-  git -C "$APP" reset --hard --quiet "origin/$BRANCH"
+  # Private repo: the token rides on a per-command header, never in .git/config.
+  grep -q '^GITHUB_TOKEN=.' "$ENV_FILE" || { log "no PV_CODE_BUNDLE and no GITHUB_TOKEN -- cannot get the code"; exit 1; }
+  TOKEN="$(sed -n 's/^GITHUB_TOKEN=//p' "$ENV_FILE")"
+  GIT_AUTH=(-c "http.https://github.com/.extraheader=Authorization: Basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)")
+  if [ ! -d "$APP/.git" ]; then
+    log "cloning $REPO_URL ($BRANCH) -> $APP"
+    git "${GIT_AUTH[@]}" clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP"
+  else
+    log "updating $APP to origin/$BRANCH"
+    git "${GIT_AUTH[@]}" -C "$APP" fetch --quiet origin "$BRANCH"
+    git -C "$APP" reset --hard --quiet "origin/$BRANCH"
+  fi
 fi
 log "running $(git -C "$APP" rev-parse --short HEAD): $(git -C "$APP" log -1 --pretty=%s)"
 

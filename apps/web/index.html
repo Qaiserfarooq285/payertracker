@@ -14,7 +14,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <!-- cache-busted by content hash so a redeploy never leaves a browser on the old stylesheet -->
-  <link rel="stylesheet" href="css/style.css?v=8151a090">
+  <link rel="stylesheet" href="css/style.css?v=cc419d64">
 </head>
 <body>
 
@@ -22,7 +22,7 @@
        password is configured and this browser has no session yet. -->
   <div id="login-overlay" class="login-overlay hidden">
     <form class="login-card" id="login-form" autocomplete="off">
-      <img class="login-logo" src="assets/logo.png" alt="College Soccer Reach">
+      <img class="login-logo" src="assets/logo-crest.png" alt="College Soccer Reach">
       <h2>The <span>Reach</span> Vision</h2>
       <p>This instance is private. Enter the access password to continue.</p>
       <input type="password" id="login-password" placeholder="Access password" autofocus required>
@@ -36,7 +36,7 @@
     <div class="nav-container">
       <a class="brand" href="/">
         <div class="brand-logo">
-          <img src="assets/logo-white.png" alt="College Soccer Reach crest">
+          <img src="assets/logo-crest.png" alt="College Soccer Reach crest">
         </div>
         <div class="brand-text">
           <span class="brand-title">The <span class="accent-text">Reach</span> Vision</span>
@@ -202,13 +202,30 @@
 
         <!-- GPU tier (2026-09-19): three price/speed classes from apps/gateway/runpod_pods.py
              GPU_TIERS, with RunPod's live per-hour price and per-datacenter stock from
-             /api/gpus. The pick rides along as `gpu_tier` on /api/process. -->
+             /api/gpus. Since 2026-09-26 the pick is what Start GPU switches on. -->
         <div class="form-group margin-top-md">
-          <label><i class="fa-solid fa-microchip"></i> GPU for this run <span class="form-hint">(billed per hour while the pod is up)</span></label>
+          <label><i class="fa-solid fa-microchip"></i> GPU tier <span class="form-hint">(used when you press Start GPU; billed per hour only while it is on)</span></label>
           <div class="gpu-tiers" id="gpu-tiers">
             <div class="form-hint">Loading GPU prices from RunPod...</div>
           </div>
           <div class="gpu-note" id="gpu-note"></div>
+        </div>
+
+        <!-- GPU power (2026-09-26): the ONLY way the RunPod GPU is switched on. Off by default;
+             auto-stops when idle. State from the gateway's /api/pod. Hidden on a plain pod server. -->
+        <div class="gpu-power hidden" id="gpu-power" data-state="off" aria-live="polite">
+          <div class="gpu-power-head">
+            <span class="gpu-power-dot" aria-hidden="true"></span>
+            <div class="gpu-power-text">
+              <strong id="gpu-power-title">GPU is off</strong>
+              <span id="gpu-power-detail">Nothing is billing. Press Start GPU when you're ready to process.</span>
+            </div>
+          </div>
+          <div class="gpu-power-meta" id="gpu-power-meta"></div>
+          <div class="gpu-power-actions">
+            <button type="button" class="btn btn-primary" id="btn-gpu-start"><i class="fa-solid fa-power-off"></i> Start GPU</button>
+            <button type="button" class="btn btn-danger hidden" id="btn-gpu-stop"><i class="fa-solid fa-stop"></i> Stop GPU</button>
+          </div>
         </div>
 
         <!-- Action Button -->
@@ -221,7 +238,10 @@
       <div class="card logs-card">
         <div class="card-header">
           <h3><i class="fa-solid fa-terminal"></i> Progress</h3>
-          <span class="badge" id="job-status-badge">Idle</span>
+          <div class="progress-head-actions">
+            <button type="button" class="btn btn-secondary btn-sm hidden" id="btn-cancel-job"><i class="fa-solid fa-xmark"></i> Cancel job</button>
+            <span class="badge" id="job-status-badge">Idle</span>
+          </div>
         </div>
 
         <!-- Progress Bar -->
@@ -515,6 +535,6 @@
     <span>Green box = other players · Red box = target</span>
   </footer>
 
-  <script src="js/app.js?v=0674d510"></script>
+  <script src="js/app.js?v=d81caa52"></script>
 </body>
 </html>

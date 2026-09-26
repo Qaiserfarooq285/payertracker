@@ -517,6 +517,57 @@ textarea.form-control { min-height: 72px; resize: vertical; line-height: 1.45; }
 }
 .btn-secondary:hover:not(:disabled) { border-color: var(--green); color: var(--green-bright); background: var(--green-soft); }
 
+.btn-danger {
+  background: transparent;
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.5);
+}
+.btn-danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.1); border-color: var(--danger); }
+.btn-sm { min-height: 34px; padding: 6px 12px; font-size: 12.5px; gap: 6px; }
+
+/* ---------- GPU power (Start / Stop GPU, 2026-09-26) ---------- */
+.gpu-power {
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-strong);
+  background: var(--bg-2);
+  display: grid;
+  gap: 12px;
+}
+.gpu-power-head { display: flex; gap: 12px; align-items: flex-start; }
+.gpu-power-dot {
+  flex: 0 0 auto;
+  width: 12px; height: 12px; margin-top: 4px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.gpu-power-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.gpu-power-text strong { font-family: var(--font-display); font-size: 1.1rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink); }
+.gpu-power-text span { font-size: 12.5px; color: var(--text-muted); line-height: 1.45; overflow-wrap: anywhere; }
+.gpu-power-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.gpu-power-meta:empty { display: none; }
+.gpu-power-meta .meta-pill {
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--line-strong); color: var(--text);
+}
+.gpu-power-meta .meta-pill.warn { color: var(--warn); border-color: rgba(245, 185, 33, 0.45); }
+.gpu-power-meta .meta-pill.bad { color: var(--danger); border-color: rgba(239, 68, 68, 0.45); }
+.gpu-power-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.gpu-power-actions .btn { flex: 1 1 160px; }
+.gpu-power[data-state="on"] { border-color: var(--green-line); box-shadow: var(--shadow-green); }
+.gpu-power[data-state="on"] .gpu-power-dot { background: var(--green); box-shadow: 0 0 0 4px var(--green-soft); }
+.gpu-power[data-state="busy"] .gpu-power-dot { background: var(--green-bright); animation: blink 1.2s ease-in-out infinite; }
+.gpu-power[data-state="waiting"] { border-color: rgba(245, 185, 33, 0.45); }
+.gpu-power[data-state="waiting"] .gpu-power-dot { background: var(--warn); animation: blink 1.6s ease-in-out infinite; }
+.gpu-power[data-state="error"] { border-color: rgba(239, 68, 68, 0.45); }
+.gpu-power[data-state="error"] .gpu-power-dot { background: var(--danger); }
+.progress-head-actions { display: flex; align-items: center; gap: 8px; }
+@media (prefers-reduced-motion: reduce) {
+  .gpu-power-dot { animation: none !important; }
+}
+
 /* ---------- progress & terminal ---------- */
 .progress-wrapper { margin-bottom: 14px; }
 .progress-info { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; margin-bottom: 8px; }
@@ -875,7 +926,14 @@ textarea.form-control { min-height: 72px; resize: vertical; line-height: 1.45; }
     font-size: 15px;
     box-shadow: 0 10px 30px -6px rgba(0, 0, 0, 0.45), 0 0 0 1px var(--green-line);
   }
-  #btn-process:disabled { opacity: 0.85; }
+  /* It floats over the page, so a disabled state must stay opaque ("Start the GPU first" is now
+     a common, not a momentary, state) -- see-through text underneath is unreadable. */
+  #btn-process:disabled {
+    opacity: 1;
+    background: var(--card-2);
+    color: var(--text-muted);
+    box-shadow: 0 10px 30px -6px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--line-strong);
+  }
 
   /* progress */
   .terminal-logs { height: 150px; font-size: 11.5px; }

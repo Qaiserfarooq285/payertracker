@@ -13,8 +13,14 @@ saw nothing but a "pod is asleep" page. The gateway keeps the FRONTEND up no mat
                                       /api/process on the pod -> mirror status
 
 Same URL contract as the pod's own `apps/api/main.py`, so `apps/web` is served unchanged: what
-needs the GPU is proxied when the pod is online and answered with a 503 + `pod` state (and a
-wake request) when it isn't; what doesn't (uploads, the video list, the queue) is answered here.
+needs the GPU is proxied when the pod is online and answered with a 503 + `pod` state when it
+isn't; what doesn't (uploads, the video list, the queue) is answered here.
+
+The GPU is the USER's to switch on and off (2026-09-26, after the old auto-wake/auto-recreate
+policy burned the credit): `POST /api/pod/start` and `POST /api/pod/stop` are the only things
+that start or stop it, plus an idle auto-stop (`PV_GPU_IDLE_MINUTES`, default 10) that only ever
+STOPS. Pods fetch their bootstrap + code from this gateway (`/pod/*`), not from GitHub, so an
+expired GitHub token can no longer leave pods that never boot.
 
 Configuration is environment only (docker/vps/gateway.env.example):
     PV_ACCESS_PASSWORD   the shared login (same value on the pod)
@@ -23,6 +29,8 @@ Configuration is environment only (docker/vps/gateway.env.example):
     PV_GATEWAY_DATA      state dir (uploads + jobs.json), default /var/lib/pitchvision
     PV_POD_NAME / PV_VOLUME_NAME / PV_DATACENTER / PV_GPU_TYPES / PV_POD_PORT
     PV_POD_SSH_PUBLIC_KEY, GEMINI_API_KEY, PV_IDLE_STOP_MINUTES   passed through to the pod
+    PV_PUBLIC_URL        this gateway's public https URL; pods fetch their code from it
+    PV_GPU_IDLE_MINUTES  stop a billing pod after this long with no job and no use (0 = never)
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ import logging
 import os
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -61,6 +70,8 @@ DATA_DIR = Path(os.environ.get("PV_GATEWAY_DATA", "/var/lib/pitchvision"))
 INPUT_DIR = DATA_DIR / "input"
 JOBS_FILE = DATA_DIR / "jobs.json"
 STATE_REFRESH_S = float(os.environ.get("PV_POD_REFRESH_SECONDS", "30"))
+GPU_IDLE_S = float(os.environ.get("PV_GPU_IDLE_MINUTES", "10")) * 60.0
+BOOTSTRAP_SCRIPT = BASE_DIR / "docker" / "runpod_bootstrap.sh"
 
 app = FastAPI(title="The Reach Vision gateway")
 
@@ -70,6 +81,14 @@ app = FastAPI(title="The Reach Vision gateway")
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, "").strip() or default
+
+
+def pod_bootstrap_key() -> str:
+    """What a pod presents to fetch `/pod/bootstrap.sh` + `/pod/code.tar.gz`. Derived from secrets
+    the gateway already has, so it needs no storage and changes when they are rotated."""
+    password, _ = resolve_access_password(os.environ.get("PV_ACCESS_PASSWORD"))
+    secret = (password or _env("RUNPOD_API_KEY") or "pitchvision").encode("utf-8")
+    return hmac.new(secret, b"pv-pod-bootstrap", hashlib.sha256).hexdigest()[:40]
 
 
 def pod_config_from_env() -> PodConfig:
@@ -86,6 +105,10 @@ def pod_config_from_env() -> PodConfig:
     for src, dst in (("GITHUB_TOKEN", "GITHUB_TOKEN"), ("GEMINI_API_KEY", "GEMINI_API_KEY"), ("PV_POD_SSH_PUBLIC_KEY", "PUBLIC_KEY")):
         if _env(src):
             pod_env[dst] = _env(src)
+    # Code comes from this gateway when it knows its own public URL (runpod_pods.pod_create_body).
+    if _env("PV_PUBLIC_URL"):
+        pod_env["PV_GATEWAY_URL"] = _env("PV_PUBLIC_URL").rstrip("/")
+        pod_env["PV_POD_KEY"] = pod_bootstrap_key()
     gpu_types = tuple(g.strip() for g in _env("PV_GPU_TYPES").split(",") if g.strip()) or rp.DEFAULT_GPU_TYPES
     return PodConfig(
         name=_env("PV_POD_NAME", rp.DEFAULT_POD_NAME),
@@ -102,8 +125,8 @@ if ACCESS_PASSWORD_IS_DEFAULT:
     logger.warning("using the default access password (%s) -- set PV_ACCESS_PASSWORD", DEFAULT_ACCESS_PASSWORD)
 if not _env("RUNPOD_API_KEY"):
     logger.warning("RUNPOD_API_KEY is not set -- the gateway cannot start or create the pod")
-if not _env("GITHUB_TOKEN"):
-    logger.warning("GITHUB_TOKEN is not set -- a newly created pod could not fetch the private repo")
+if not _env("PV_PUBLIC_URL") and not _env("GITHUB_TOKEN"):
+    logger.warning("neither PV_PUBLIC_URL nor GITHUB_TOKEN is set -- a new pod could not fetch the code")
 
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -113,31 +136,12 @@ JOBS = JobStore(JOBS_FILE)
 WORKER = JobWorker(JOBS, PODS, POD_CLIENT, INPUT_DIR)
 _UPLOADS = ChunkedUploads()
 
-# "Someone wants the pod" without a job: results browsing, the frame picker. One wake at a time.
-_WAKE_LOCK = threading.Lock()
-_wake_thread: threading.Thread | None = None
-
-
-def request_wake() -> None:
-    global _wake_thread
-    with _WAKE_LOCK:
-        if PODS.online or (_wake_thread is not None and _wake_thread.is_alive()):
-            return
-        _wake_thread = threading.Thread(target=_wake, name="gateway-pod-wake", daemon=True)
-        _wake_thread.start()
-
-
-def _wake() -> None:
-    try:
-        PODS.ensure_online()
-    except Exception as exc:
-        logger.warning("wake failed: %s", exc)
-
-
 def _refresh_loop() -> None:
     while True:
         try:
             PODS.refresh()
+            # The only automatic action the gateway takes on the GPU: STOP one nobody is using.
+            PODS.idle_check(GPU_IDLE_S, busy=bool(JOBS.active()))
         except Exception as exc:
             logger.warning("pod refresh: %s", exc)
         time.sleep(STATE_REFRESH_S)
@@ -157,7 +161,8 @@ _SESSION_COOKIE = "pv_session"
 _SESSION_KEY = secrets.token_bytes(32)
 _SESSION_MAX_AGE_S = 30 * 24 * 3600
 _LOGIN_FAIL_DELAY_S = 0.5
-_PUBLIC_PATH_PREFIXES = ("/api/health", "/api/login", "/api/auth/status")
+# `/pod/` is fetched by the pod at boot and checks its own key (`_check_pod_key`).
+_PUBLIC_PATH_PREFIXES = ("/api/health", "/api/login", "/api/auth/status", "/pod/")
 _PUBLIC_STATIC_PREFIXES = ("/css/", "/js/", "/assets/", "/favicon")  # the login card needs the logo
 
 
@@ -233,9 +238,105 @@ def get_health():
     }
 
 
+# RunPod account balance + current spend, for the GPU control card. Cached: it is polled.
+_ACCOUNT: dict[str, Any] = {"at": 0.0, "data": None, "error": ""}
+_ACCOUNT_TTL_S = 60.0
+_ACCOUNT_LOCK = threading.Lock()
+
+
+def _account() -> tuple[dict[str, float] | None, str]:
+    with _ACCOUNT_LOCK:
+        if time.time() - _ACCOUNT["at"] >= _ACCOUNT_TTL_S:
+            try:
+                _ACCOUNT.update(at=time.time(), data=rp.fetch_account(_env("RUNPOD_API_KEY")), error="")
+            except rp.RunPodError as exc:
+                logger.warning("balance lookup failed: %s", exc)
+                _ACCOUNT.update(at=time.time(), error=str(exc))
+        return _ACCOUNT["data"], _ACCOUNT["error"]
+
+
 @app.get("/api/pod")
 def get_pod():
-    return {"pod": PODS.state.full(), "active_jobs": JOBS.active()}
+    account, account_error = _account()
+    return {
+        "pod": PODS.state.full(),
+        "starting": PODS.starting,
+        "active_jobs": JOBS.active(),
+        "idle_stop_minutes": GPU_IDLE_S / 60.0,
+        "account": account,
+        "account_error": account_error or None,
+    }
+
+
+class PodStartRequest(BaseModel):
+    gpu_tier: str | None = None
+
+
+@app.post("/api/pod/start")
+def start_pod(req: PodStartRequest | None = None):
+    """The Start GPU button -- the ONLY way a GPU pod is created or started."""
+    tier_id = req.gpu_tier if req else None
+    tier = rp.gpu_tier(tier_id) if tier_id else None
+    if tier_id and tier is None:
+        raise HTTPException(status_code=400, detail=f"unknown gpu_tier {tier_id!r}")
+    if PODS.online and not PODS.starting:
+        return {"status": "already_on", "pod": PODS.state.public()}
+    started = PODS.start(tier["gpu_type_ids"] if tier else None)
+    _ACCOUNT["at"] = 0.0
+    return {"status": "starting" if started else "already_starting", "pod": PODS.state.public()}
+
+
+@app.post("/api/pod/stop")
+def stop_pod():
+    """The Stop GPU button: cancel what is queued/running, then stop + terminate the pod (on a
+    thread -- RunPod can take a minute; the UI follows along via /api/pod)."""
+    cancelled = JOBS.cancel_active("the GPU was stopped")
+    PODS.state.wanted = False
+
+    def run() -> None:
+        PODS.stop()
+        _ACCOUNT["at"] = 0.0  # show the new spend rate right away, not after the cache expires
+
+    threading.Thread(target=run, name="gateway-pod-stop", daemon=True).start()
+    return {"status": "stopping", "cancelled_jobs": cancelled}
+
+
+# ---------------------------------------------------------------- what a booting pod fetches
+
+
+def _check_pod_key(request: Request) -> None:
+    if not hmac.compare_digest(request.headers.get("x-pv-pod-key", ""), pod_bootstrap_key()):
+        raise HTTPException(status_code=403, detail="bad pod key")
+
+
+@app.get("/pod/bootstrap.sh")
+def pod_bootstrap(request: Request):
+    _check_pod_key(request)
+    return FileResponse(BOOTSTRAP_SCRIPT, media_type="text/x-shellscript")
+
+
+_CODE_LOCK = threading.Lock()
+
+
+@app.get("/pod/code.tar.gz")
+def pod_code(request: Request):
+    """The gateway's own checkout (exactly what is deployed) as a tarball, cached per commit."""
+    _check_pod_key(request)
+    with _CODE_LOCK:
+        try:
+            sha = subprocess.run(["git", "-C", str(BASE_DIR), "rev-parse", "HEAD"], capture_output=True,
+                                 text=True, check=True, timeout=30).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HTTPException(status_code=500, detail=f"no git checkout to serve: {exc}") from exc
+        target = DATA_DIR / f"code-{sha[:12]}.tar.gz"
+        if not target.exists():
+            for old in DATA_DIR.glob("code-*.tar.gz"):
+                old.unlink(missing_ok=True)
+            tmp = target.with_suffix(".tmp")
+            subprocess.run(["git", "-C", str(BASE_DIR), "archive", "--format=tar.gz", "-o", str(tmp), sha],
+                           check=True, timeout=120)
+            os.replace(tmp, target)
+    return FileResponse(target, media_type="application/gzip", headers={"X-PV-Commit": sha[:12]})
 
 
 # GPU tiers with RunPod's live per-hour price and per-datacenter stock (2026-09-19). One GraphQL
@@ -301,20 +402,16 @@ def list_gpus():
     }
 
 
-@app.post("/api/pod/wake")
-def wake_pod():
-    request_wake()
-    return {"status": "ok", "pod": PODS.state.public()}
-
-
 def _pod_unavailable(action: str) -> HTTPException:
     st = PODS.state
     if st.phase == WAITING_FOR_GPU:
-        detail = f"No GPU available on RunPod right now -- {action} will work as soon as one frees up. {st.message}"
+        detail = f"No GPU free on RunPod yet -- {action} will work once the GPU is on. {st.message}"
     elif st.phase == ERROR:
-        detail = f"GPU pod error: {st.message}"
+        detail = f"GPU error: {st.message}"
+    elif PODS.starting or st.wanted:
+        detail = f"The GPU is starting -- {action} will work in a few minutes. ({st.message})"
     else:
-        detail = f"The GPU pod is waking up -- {action} will work in a minute or two. ({st.message})"
+        detail = f"The GPU is off -- press Start GPU to use {action} (it bills only while on)."
     return HTTPException(status_code=503, detail=detail, headers={"Retry-After": "30"})
 
 
@@ -381,6 +478,10 @@ async def process_video(request: Request):
     video_name = str(payload["video_name"])
     if payload.get("gpu_tier") and rp.gpu_tier(payload["gpu_tier"]) is None:
         raise HTTPException(status_code=400, detail=f"unknown gpu_tier {payload['gpu_tier']!r}")
+    if not (PODS.online or PODS.starting or PODS.state.wanted):
+        # Run never switches the GPU on by itself (2026-09-26) -- that is the Start GPU button.
+        raise HTTPException(status_code=409, detail="The GPU is off. Press Start GPU first -- it bills "
+                            "only while on, and stops itself when idle.")
     if JOBS.video_in_flight(video_name):
         raise HTTPException(status_code=409, detail=f"'{video_name}' is already queued or being processed.")
     if not (INPUT_DIR / video_name).exists() and not PODS.online:
@@ -398,6 +499,14 @@ def get_job_status(job_id: str):
     return JOBS.public(job)
 
 
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = JOBS.cancel(job_id, "cancelled by you")
+    if job is None:
+        raise HTTPException(status_code=409, detail="That job is not queued or running.")
+    return JOBS.public(job)
+
+
 @app.get("/api/jobs")
 def list_jobs():
     jobs = JOBS.list()
@@ -411,8 +520,8 @@ _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
 
 async def _proxy(request: Request, action: str) -> StreamingResponse:
     if not PODS.online:
-        request_wake()
-        raise _pod_unavailable(action)
+        raise _pod_unavailable(action)  # never wakes the GPU -- that is the user's Start button
+    PODS.touch()  # browsing results is GPU use: keep the idle auto-stop from firing under it
     body = await request.body()
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
     path_qs = request.url.path + (f"?{request.url.query}" if request.url.query else "")

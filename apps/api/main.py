@@ -7,6 +7,7 @@ jersey OCR, event detection, movement analytics, and stat card visualization.
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -216,6 +217,52 @@ def logout():
 # Global in-memory job store for background processing tasks
 JOBS: dict[str, dict[str, Any]] = {}
 
+# Long videos (2026-09-26): a 10-minute clip runs for well over half an hour on the GPU, and the
+# staged messages in `_run_pipeline_job` are all written in its first few seconds -- after that the
+# job log froze on one line while the real pipeline only logged to the server console, so a long
+# run looked hung. `_JobLogHandler` forwards the pipeline's own INFO lines (`src.*` loggers) into
+# the job's log, which the web app and the gateway already mirror. Filtered by thread, so two jobs
+# running at once never see each other's lines; head + tail kept so the log stays small.
+JOB_LOG_KEEP_HEAD = 10
+JOB_LOG_MAX_LINES = 300
+# Refuse a run up front when the volume is nearly full, instead of dying mid-render hours in.
+MIN_FREE_DISK_GB = float(os.environ.get("PV_MIN_FREE_DISK_GB", "3"))
+
+
+class _JobLogHandler(logging.Handler):
+    def __init__(self, job: dict[str, Any], thread_id: int) -> None:
+        super().__init__(level=logging.INFO)
+        self.job = job
+        self.thread_id = thread_id
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.thread != self.thread_id or not record.name.startswith("src."):
+            return
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+        logs = self.job["logs"]
+        logs.append(f"[{time.strftime('%H:%M:%S')}] {message[:300]}")
+        if len(logs) > JOB_LOG_MAX_LINES:
+            del logs[JOB_LOG_KEEP_HEAD : len(logs) - (JOB_LOG_MAX_LINES - JOB_LOG_KEEP_HEAD)]
+
+
+def _attach_job_log(job: dict[str, Any]) -> _JobLogHandler:
+    """Start forwarding this thread's pipeline log lines into `job["logs"]`. The `src` loggers
+    are raised to INFO if nothing else configured them (root is WARNING by default, and
+    `get_logger`'s basicConfig is a no-op once any handler exists) -- else nothing would arrive."""
+    src_logger = logging.getLogger("src")
+    if src_logger.getEffectiveLevel() > logging.INFO:
+        src_logger.setLevel(logging.INFO)
+    handler = _JobLogHandler(job, threading.get_ident())
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def _disk_free_gb(path: Path) -> float:
+    return shutil.disk_usage(path).free / 1e9
+
 # Which video slugs currently have a pipeline job in flight, and the lock guarding that set.
 #
 # Real corruption this prevents (owner-reported 2026-09-15, root-caused from the server log):
@@ -309,6 +356,7 @@ def get_health():
         "input_dir": str(INPUT_DIR),
         "output_dir": str(OUTPUT_DIR),
         "idle_stop": IDLE_WATCHDOG.status(),
+        "disk_free_gb": round(_disk_free_gb(WORK_DIR), 1),
     }
 
 
@@ -986,6 +1034,7 @@ def _run_pipeline_job(
     _job_slug_for_release = JOBS[job_id].get("canonical_slug") or ""
 
     job = JOBS[job_id]
+    log_handler = _attach_job_log(job)
     job["status"] = "processing"
     job["progress"] = 5
     job["stage"] = "Initializing Environment"
@@ -1283,6 +1332,7 @@ def _run_pipeline_job(
         job["error"] = message
         job["logs"].append(f"ERROR: {message}")
     finally:
+        logging.getLogger().removeHandler(log_handler)
         # Always release this video, success or failure -- a crashed run must never leave its slug
         # permanently locked out (that would turn one bad run into "this video can never be
         # processed again" until the server restarts).
@@ -1297,6 +1347,16 @@ def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
     # Refused here, before a job is even created, so the caller gets an immediate, actionable 409
     # rather than a job that "starts" and then dies on a half-written clip file.
     slug = _canonical_slug(_resolve_video_path(req.video_name))
+    free_gb = _disk_free_gb(WORK_DIR)
+    if free_gb < MIN_FREE_DISK_GB:
+        raise HTTPException(
+            status_code=507,
+            detail=(
+                f"Only {free_gb:.1f} GB free on the GPU pod's storage (need {MIN_FREE_DISK_GB:.0f} GB "
+                "or more) -- a long video would fail part-way. Delete old outputs or grow the "
+                "network volume, then run again."
+            ),
+        )
     with _INFLIGHT_LOCK:
         if slug in _INFLIGHT_SLUGS:
             raise HTTPException(

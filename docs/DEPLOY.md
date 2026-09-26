@@ -116,14 +116,25 @@ browser ──https──▶ KVM VPS: nginx (TLS) ──▶ gateway :8100 (apps/
 "pod is asleep" page and nothing else. The gateway keeps the **site up with no pod at all**:
 
 - The frontend, login and **uploads always work**; uploads land on the VPS disk (`/var/lib/pitchvision/input`).
-- **Run** queues a job. The gateway then gets a pod: **Start** it if it's merely stopped; if RunPod
-  refuses (GPU taken) it **terminates the dead pod and creates a fresh one** on any card from the
-  preference list (`PV_GPU_TYPES`); if RunPod has **no GPU at all** the job shows *"No GPU available on
-  RunPod right now — waiting; processing starts automatically when one frees up"* and retries every
-  minute, forever. The header badge shows the same phase.
+- **The GPU is switched on and off by the user, nowhere else** (since 2026-09-26 — the old
+  "wake on any request, recreate whatever fails, wait forever" policy burned the whole credit):
+  - **Start GPU** (the panel under the GPU tiers) creates/starts the pod on the chosen tier. If RunPod
+    has no card it retries every minute for at most **15 min**, then gives up (a card freeing up hours
+    later must not start billing while nobody is there). An **empty balance** is shown as such, at once.
+    A pod that is not up within **20 min** is stopped + terminated and reported — never recreated in a loop.
+  - **Stop GPU** cancels queued/running jobs, then stops **and** terminates the pod. Nothing bills.
+  - **Idle auto-stop**: a billing pod with no job and no use for `PV_GPU_IDLE_MINUTES` (default 10) is
+    stopped by the gateway — this works even when the pod's own app never booted.
+  - **Run** is refused while the GPU is off; a job queued while it is starting waits for it, for free,
+    and can be cancelled. Page loads, results views and queued jobs never start the GPU.
+  - The panel shows the card, its $/h, the auto-stop countdown and the RunPod balance.
 - Once the pod answers `/api/health` the gateway pushes the video (skipped when the volume already
-  has it), starts the pipeline and mirrors its progress/results/media back to the browser. Nothing
-  changes on the pod side; its idle auto-stop still stops it afterwards.
+  has it), starts the pipeline and mirrors its progress/results/media back to the browser. The job
+  log carries the pipeline's real progress lines, so a long video no longer looks frozen.
+- **Pods get their code from the gateway**, not GitHub: `/pod/bootstrap.sh` + `/pod/code.tar.gz`
+  (a tarball of the VPS checkout), authorised by a key derived from the site password. An expired
+  GitHub token (what happened on 2026-09-24 — every new pod died at its first command) can no
+  longer stop a pod from booting.
 - The queue is persisted (`/var/lib/pitchvision/jobs.json`): a refreshed page — or a rebooted VPS —
   picks up where it was. Jobs run one at a time.
 - Because the pod is found **by name**, nothing ever needs re-pointing when its id changes.
@@ -131,20 +142,20 @@ browser ──https──▶ KVM VPS: nginx (TLS) ──▶ gateway :8100 (apps/
 1. **DNS** — Hostinger hPanel → Domains → your domain → DNS records → add
    `A  app  <VPS IPv4>  TTL 300`. (`app` = subdomain; use `@` for the bare domain.) Wait until
    `dig +short app.yourdomain.com` returns the VPS IP (usually minutes).
-2. **From your Mac**, with the secrets in place (`~/.ssh/pitchvision_github_token.txt`,
-   `~/.ssh/pitchvision_runpod_key.txt`, `~/.ssh/pitchvision_site_password.txt`, the VPS SSH key
-   `~/.ssh/pitchvision_vps`), run:
+2. **From your Mac**, with the secrets in place (`~/.ssh/pitchvision_runpod_key.txt`,
+   `~/.ssh/pitchvision_site_password.txt`, the VPS SSH key `~/.ssh/pitchvision_vps`; a GitHub token
+   is no longer needed), run:
 
    ```bash
    bash docker/deploy_vps.sh
    ```
 
-   It copies `docker/vps/setup_vps.sh` to the VPS and runs it: installs nginx + certbot + a tiny
-   Python venv, clones the repo to `/opt/pitchvision`, writes `/etc/pitchvision/gateway.env`
+   It ships your local `master` as a `git bundle` over SSH and runs `docker/vps/setup_vps.sh`:
+   installs nginx + certbot + a tiny Python venv, checks the code out to `/opt/pitchvision`, writes `/etc/pitchvision/gateway.env`
    (template: `docker/vps/gateway.env.example`), installs the `pitchvision-gateway` systemd unit,
    writes the vhost from `docker/vps/pitchvision.nginx.conf`, gets the certificate (HTTP challenge —
-   so do step 1 first) and turns on the https redirect. **Re-run it after every `git push`** to
-   update the gateway; the pod fast-forwards itself on its next boot.
+   so do step 1 first) and turns on the https redirect. **Re-run it after every commit** to
+   update the gateway; the pod picks up the same code on its next Start GPU.
 3. Open **https://app.yourdomain.com** → the login overlay → your `PV_ACCESS_PASSWORD`.
    `https://app.yourdomain.com/api/health` shows `pod.phase` (`offline` / `starting` / `booting` /
    `waiting_for_gpu` / `online`) and, once online, the GPU the pod sees.
@@ -190,8 +201,8 @@ bypasses Cloudflare, which is why the in-app password still matters.)
 
 | Task | How |
 |---|---|
-| **Stop paying** when not in use | Nothing to do: idle auto-stop below stops the pod; the gateway starts (or recreates) it the next time someone presses **Run**. Manual Stop from the console still works. |
-| Update the app | `git push` to `master` → `bash docker/deploy_vps.sh` (gateway) → the pod fast-forwards on its next boot (or Pod → **Restart** to do it now). Pin a branch with `PV_BRANCH`; freeze with `PV_AUTO_UPDATE=0`. |
+| **Stop paying** when not in use | Press **Stop GPU**. If you forget, the gateway's idle auto-stop (10 min) and the pod's own (30 min) stop it. It only comes back when someone presses **Start GPU**. |
+| Update the app | commit on `master` → `git push` → `bash docker/deploy_vps.sh` (gateway) → the pod gets the same code on its next Start GPU. |
 | See what the pod is doing | `https://app.yourdomain.com/api/pod` (after login): phase, pod id, GPU, cost/h, the active queue. |
 | Change the password | edit `PV_ACCESS_PASSWORD` on the pod → Restart. Sessions are invalidated on every restart anyway. |
 | Free disk | SSH / web terminal: `rm -rf /workspace/pitchvision/work/*` (cached intermediates; re-created on demand). Delete old `output/<slug>/` folders you no longer need. |
@@ -221,10 +232,9 @@ A **stopped pod does not reserve its GPU**. After an idle auto-stop or a manual 
 may take the card, and Start fails with that message (the console then offers "migrate your pod").
 Nothing is lost — the network volume is separate from the pod.
 
-**With the gateway (§4-VPS) this is handled for you:** the next Run tries Start once, otherwise
-terminates the dead pod and creates a fresh one on any card from `PV_GPU_TYPES` (L4 → A4500 →
-4000 Ada → 4090), and if RunPod has none of those it keeps trying every minute while the job shows
-"No GPU available on RunPod right now — waiting". The state machine is
+**With the gateway (§4-VPS) this is handled for you:** Stop GPU terminates the pod, so the next
+Start GPU simply creates a fresh one on the chosen tier; if RunPod has none of those cards it keeps
+asking every minute for up to 15 min, then gives up and says so. The state machine is
 `apps/gateway/pod_manager.py`; `/api/pod` shows what it is doing and `journalctl -u
 pitchvision-gateway -f` on the VPS shows why.
 

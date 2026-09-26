@@ -1,23 +1,29 @@
-"""Keeps the GPU pod alive exactly when someone needs it (docs/DEPLOY.md "Always-on gateway").
+"""Runs the GPU pod exactly when the user says so (docs/DEPLOY.md "Always-on gateway").
 
-The gateway on the VPS is always up; the RunPod pod is not -- it stops itself when idle
-(`apps/api/idle_stop.py`) and, because a STOPPED pod does not reserve its GPU, it often cannot
-simply be started again. `PodManager.ensure_online()` is the one place that knows how to get from
-"whatever state RunPod is in" to "the app answers on its proxy URL":
+The gateway on the VPS is always up; the RunPod pod is not. Since 2026-09-26 the pod is under the
+USER's control, not the gateway's: it is switched on only by the Start GPU button and off by the
+Stop GPU button, by the idle auto-stop, or by a failed start. Nothing else -- not a page load,
+not a results view, not a queued job, not a gateway restart -- may create or start a pod.
 
-    no pod            -> create one on any GPU from the preference list
-    create refused    -> WAITING_FOR_GPU: tell the user, retry every `retry_s`, never give up
+Why (owner, 2026-09-26): the old "wake whenever anyone needs it, recreate whatever fails" policy
+burned the whole credit. The pods' GitHub token had expired, so every new pod died at its first
+command; the gateway kept "replacing" pods that could never boot (~13 GPU-hours, zero output)
+until the balance hit zero, then reported the refusals as "No GPU available". So:
+
+    `wanted`          set only by `start()`, cleared by `stop()` and by any failed start
+    no pod            -> create one on the chosen GPU tier
+    create refused    -> WAITING_FOR_GPU, retried every `retry_s` for at most `max_gpu_wait_s`,
+                         then give up (a GPU appearing hours later must not start billing then)
+    balance too low   -> ERROR at once, with the reason -- retrying cannot fix it
     pod stopped       -> Start; if RunPod refuses (GPU taken) -> terminate it, then create
-    pod running       -> wait for /api/health (BOOTING); a boot that never comes up is torn
-                         down and recreated once the cap passes
+    pod running       -> wait for /api/health (BOOTING); a boot that is not up within
+                         `boot_cap_s` is STOPPED + terminated and reported -- never recreated
+                         in a loop
 
-Every transition is reported through `on_progress(phase, message)` so the job that is waiting
-can show the user exactly what is going on ("No GPU available right now -- waiting"). The
-manager never raises for "no GPU": that is a normal state here, not an error. It raises only for
-things a retry cannot fix (a bad API key), so the job can fail loudly instead of spinning.
-
-Pure-ish by construction: `clock` and `sleep` are injectable, and the RunPod client is a
-parameter, so the whole state machine is unit-tested with a fake API and no real time.
+Every transition is reported through `on_progress(phase, message)`. `stop()` interrupts a start
+in progress (the waits are on a cancel event), and `idle_check()` stops a billing pod nobody has
+used for a while. `clock` and `sleep` are injectable, and the RunPod client is a parameter, so the
+whole state machine is unit-tested with a fake API and no real time.
 """
 
 from __future__ import annotations
@@ -47,8 +53,14 @@ ERROR = "error"  # something a retry won't fix (auth); a human must look
 
 DEFAULT_POLL_S = 10.0  # while starting/booting
 DEFAULT_RETRY_S = 60.0  # while waiting for a GPU
-DEFAULT_BOOT_CAP_S = 30 * 60.0  # a first boot installs deps (~10 min); anything past this is stuck
+# A boot is apt + code fetch + (only when pyproject.toml changed) deps; ~3-5 min normally, ~10 on a
+# fresh volume. Past this the pod is broken, and every further minute is billed for nothing.
+DEFAULT_BOOT_CAP_S = 20 * 60.0
+# How long a Start keeps asking RunPod for a card before giving up. Short on purpose: the user is
+# watching, and a GPU that frees up hours later must not start billing while nobody is there.
+DEFAULT_MAX_GPU_WAIT_S = 15 * 60.0
 DEFAULT_TERMINATE_WAIT_S = 90.0
+BILLING_URL = "https://www.runpod.io/console/user/billing"
 # A replacement pod is created WITH a gpuTypeId, so it coming up GPU-less means something is
 # wrong at RunPod's end; don't burn credit recreating forever.
 MAX_NO_GPU_REPLACEMENTS = 3
@@ -68,6 +80,7 @@ class PodConfig:
     poll_s: float = DEFAULT_POLL_S
     retry_s: float = DEFAULT_RETRY_S
     boot_cap_s: float = DEFAULT_BOOT_CAP_S
+    max_gpu_wait_s: float = DEFAULT_MAX_GPU_WAIT_S
     terminate_wait_s: float = DEFAULT_TERMINATE_WAIT_S
 
 
@@ -84,10 +97,19 @@ class PodState:
     checked_at: float = 0.0
     last_error: str = ""
     waiting_since: float = 0.0  # wall-clock when WAITING_FOR_GPU began (0 when not waiting)
+    wanted: bool = False  # the user pressed Start GPU and has not stopped it (nor has it failed)
+    billing: bool = False  # RunPod has a pod RUNNING under our name -- i.e. credit is being spent
+    idle_stop_in_s: float | None = None  # seconds until the idle auto-stop, when it is counting
 
     def public(self) -> dict[str, Any]:
         """What `/api/health` exposes without a login: no pod id, no cost."""
-        return {"phase": self.phase, "message": self.message, "gpu_name": self.gpu_name}
+        return {
+            "phase": self.phase,
+            "message": self.message,
+            "gpu_name": self.gpu_name,
+            "wanted": self.wanted,
+            "billing": self.billing,
+        }
 
     def full(self) -> dict[str, Any]:
         return {
@@ -102,11 +124,16 @@ class PodState:
             "checked_at": self.checked_at,
             "last_error": self.last_error,
             "waiting_since": self.waiting_since,
+            "wanted": self.wanted,
+            "billing": self.billing,
+            "idle_stop_in_s": self.idle_stop_in_s,
         }
 
 
 class PodUnavailable(Exception):
-    """`ensure_online` gave up: only for errors a retry cannot fix (auth) or a caller-imposed deadline."""
+    """`ensure_online` gave up: the GPU is off / was stopped, the start failed in a way the user
+    has to see (no GPU in time, empty balance, a pod that will not boot, bad key), or a
+    caller-imposed deadline passed."""
 
 
 ProgressFn = Callable[[str, str], None]
@@ -131,16 +158,20 @@ class PodManager:
         *,
         health_session: requests.Session | None = None,
         clock: Callable[[], float] = time.time,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
     ):
         self.client = client
         self.cfg = config
         self._health_session = health_session or requests.Session()
         self._clock = clock
-        self._sleep = sleep
-        self._lock = threading.Lock()  # serialises ensure_online callers; refresh() is lock-free
+        # `stop()` sets this; every wait inside a start returns early on it.
+        self._cancel = threading.Event()
+        self._sleep = sleep or (lambda seconds: self._cancel.wait(seconds))
+        self._lock = threading.Lock()  # serialises ensure_online / stop; refresh() never blocks on it
         self.state = PodState()
         self._volume_id: str = ""
+        self._start_thread: threading.Thread | None = None
+        self.activity_at = clock()  # last use of the GPU, for the idle auto-stop
 
     # ---------------------------------------------------------------- state helpers
 
@@ -155,11 +186,13 @@ class PodManager:
         if error:
             st.last_error = error
         if pod is not None:
+            st.billing = pod.is_running
             st.pod_id = pod.id
             st.proxy_url = rp.proxy_url(pod.id, self.cfg.port)
             st.gpu_type = pod.gpu_type
             st.cost_per_hr = pod.cost_per_hr
         elif phase in (OFFLINE, WAITING_FOR_GPU):
+            st.billing = False
             st.pod_id = ""
             st.proxy_url = ""
             st.gpu_type = ""
@@ -185,36 +218,124 @@ class PodManager:
 
     def refresh(self) -> PodState:
         """Look at RunPod + the proxy once and update `state` WITHOUT changing anything. Used by
-        the background status poller so the UI badge is honest even when no job is running."""
+        the background status poller so the UI is honest even when no job is running. Skipped
+        while a start/stop holds the lock -- that one reports its own progress."""
+        if self._lock.locked() or self.starting:
+            return self.state
         try:
             pod = self.client.find_pod(self.cfg.name)
         except RunPodError as exc:
             self._set(self.state.phase if self.state.phase != UNKNOWN else UNKNOWN,
                       f"Cannot reach RunPod: {exc}", error=str(exc))
             return self.state
-        if pod is None:
-            if self.state.phase != WAITING_FOR_GPU:
-                self._set(OFFLINE, "No GPU pod exists yet -- one is created when you press Run.")
-            return self.state
-        if not pod.is_running:
-            self._set(OFFLINE, "GPU pod is stopped -- it starts automatically when you press Run.", pod)
+        was_billing = self.state.billing
+        self.state.billing = pod is not None and pod.is_running
+        if self.state.billing and not was_billing:
+            self.touch()  # a pod we did not see running before: its idle countdown starts now
+        if pod is None or not pod.is_running:
+            if self.state.phase == ERROR:
+                return self.state  # keep the reason a start failed on screen until the next Start/Stop
+            self._set(OFFLINE, "GPU is off -- nothing is billing. Press Start GPU when you want to "
+                      "process a video.", pod)
             return self.state
         if not pod.has_gpu:
-            self._set(OFFLINE, "Pod is running WITHOUT a GPU (RunPod resumed it on CPU) -- it is "
-                      "replaced automatically when you press Run.", pod)
+            self._set(OFFLINE, "A pod is running WITHOUT a GPU (RunPod resumed it on CPU) and is "
+                      "billing -- press Stop GPU, then Start GPU.", pod)
             return self.state
         health = rp.probe_health(rp.proxy_url(pod.id, self.cfg.port), self._health_session)
         if health and not health.get("gpu_available", True):
-            self._set(OFFLINE, "Pod is up but sees no GPU -- it is replaced automatically when you press Run.", pod)
+            self._set(OFFLINE, "The pod is up but sees no GPU -- press Stop GPU, then Start GPU.", pod)
         elif health:
             self._mark_online(pod, health)
         else:
             self._set(BOOTING, f"GPU pod is running, app still starting ({_fmt_minutes(pod.uptime_s)} up).", pod)
         return self.state
 
+    # ---------------------------------------------------------------- user control
+
+    @property
+    def starting(self) -> bool:
+        """A Start GPU press is still being worked on (creating / booting / waiting for stock)."""
+        return self._start_thread is not None and self._start_thread.is_alive()
+
+    def touch(self) -> None:
+        """Someone used the GPU (a job step, a results view): restart the idle countdown."""
+        self.activity_at = self._clock()
+
+    def start(self, gpu_types: tuple[str, ...] | list[str] | None = None) -> bool:
+        """The Start GPU button. Brings the pod up on a background thread; returns False when a
+        start is already in progress (the button was pressed twice)."""
+        if self.starting:
+            return False
+        self._cancel.clear()
+        self.state.wanted = True
+        self.state.last_error = ""
+        self.touch()
+        self._set(STARTING, "Starting the GPU...")
+
+        def run() -> None:
+            try:
+                self.ensure_online(gpu_types=gpu_types)
+            except PodUnavailable as exc:
+                logger.info("start ended without a GPU: %s", exc)
+            except Exception:  # never let the thread die silently
+                logger.exception("start crashed")
+                self.state.wanted = False
+                self._set(ERROR, "Starting the GPU crashed -- see the gateway log.", error="start crashed")
+
+        self._start_thread = threading.Thread(target=run, name="gateway-pod-start", daemon=True)
+        self._start_thread.start()
+        return True
+
+    def stop(self, reason: str = "stopped by you") -> PodState:
+        """The Stop GPU button (and the idle auto-stop): abort any start in progress, then stop
+        AND terminate the pod so nothing keeps billing. The network volume -- uploads, results --
+        is untouched; the next Start creates a fresh pod on it."""
+        self.state.wanted = False
+        self._cancel.set()
+        with self._lock:  # waits for a running start to notice the cancel and let go
+            self._cancel.clear()
+            self.state.wanted = False
+            try:
+                pod = self.client.find_pod(self.cfg.name)
+            except RunPodError as exc:
+                self._set(ERROR, f"Could not reach RunPod to stop the GPU ({exc}) -- check the RunPod "
+                          "console.", error=str(exc))
+                return self.state
+            if pod is not None and not self._shut_down(pod.id):
+                self._set(ERROR, "RunPod did not stop the GPU pod -- stop it in the RunPod console; "
+                          "it is still billing.", pod, error="stop failed")
+                self.state.billing = True
+                return self.state
+            self.state.billing = False
+            self._set(OFFLINE, f"GPU is off ({reason}) -- nothing is billing. Press Start GPU when "
+                      "you want to process a video.")
+            return self.state
+
+    def idle_check(self, idle_s: float, busy: bool) -> float | None:
+        """Called by the gateway's poller. While a pod is billing, nobody is starting/stopping
+        it, and no job is using it, count down `idle_s` from the last use and stop it at zero.
+        Returns (and records in `state`) the seconds left, or None when not counting."""
+        st = self.state
+        if busy:
+            self.touch()
+        if idle_s <= 0 or busy or not st.billing or self._lock.locked():
+            st.idle_stop_in_s = None
+            return None
+        left = self.activity_at + idle_s - self._clock()
+        if left > 0:
+            st.idle_stop_in_s = left
+            return left
+        st.idle_stop_in_s = None
+        logger.info("idle auto-stop: no GPU use for %.0f min", idle_s / 60)
+        self.stop(f"auto-stopped after {int(idle_s // 60)} min with nothing to do")
+        return 0.0
+
     def _mark_online(self, pod: PodInfo, health: dict) -> None:
         gpu = str(health.get("gpu_name") or pod.gpu_type or "GPU")
-        self._set(ONLINE, f"GPU pod online ({gpu}).", pod)
+        if self.state.phase != ONLINE:
+            self.touch()  # the idle countdown starts when the GPU is actually usable
+        self._set(ONLINE, f"GPU online ({gpu}) -- billing until you press Stop GPU.", pod)
         self.state.gpu_name = gpu
 
     # ---------------------------------------------------------------- the state machine
@@ -236,12 +357,20 @@ class PodManager:
         used only when a pod has to be CREATED -- an existing pod on any card is kept as before
         (a plain wake-up must never throw a healthy pod away)."""
         with self._lock:
-            return self._ensure_online_locked(
-                on_progress,
-                deadline_s,
-                tuple(gpu_types) if gpu_types else self.cfg.gpu_types,
-                strict_gpu=bool(gpu_types),
-            )
+            if not self.state.wanted:
+                raise PodUnavailable("The GPU is off -- press Start GPU.")
+            try:
+                return self._ensure_online_locked(
+                    on_progress,
+                    deadline_s,
+                    tuple(gpu_types) if gpu_types else self.cfg.gpu_types,
+                    strict_gpu=bool(gpu_types),
+                )
+            except PodUnavailable:
+                # Any failed or cancelled start leaves the GPU OFF: it is never retried behind
+                # the user's back. `billing` is re-read by the next refresh.
+                self.state.wanted = False
+                raise
 
     def _ensure_online_locked(
         self,
@@ -264,9 +393,19 @@ class PodManager:
                 on_progress(*key)
 
         def wait(seconds: float) -> None:
+            if self._cancel.is_set() or not self.state.wanted:
+                raise PodUnavailable("stopped")
             if deadline is not None and self._clock() + seconds > deadline:
                 raise PodUnavailable(self.state.message or "gave up waiting for the GPU pod")
             self._sleep(seconds)
+            if self._cancel.is_set() or not self.state.wanted:
+                raise PodUnavailable("stopped")
+
+        def low_balance(exc: RunPodError) -> None:
+            self._set(ERROR, "RunPod refused: the account balance is too low to rent a GPU. Add "
+                      f"funds at {BILLING_URL}, then press Start GPU.", error=str(exc))
+            report()
+            raise PodUnavailable(self.state.message) from exc
 
         while True:
             try:
@@ -307,14 +446,26 @@ class PodManager:
                         self._set(ERROR, f"RunPod rejected the API key: {exc}", error=str(exc))
                         report()
                         raise PodUnavailable(self.state.message) from exc
+                    if rp.is_low_balance_error(str(exc)):
+                        low_balance(exc)
                     # Anything else from POST /pods is, in practice, "no stock for these GPU
                     # types right now" -- RunPod phrases it several ways. Keep the raw reason.
                     waited = self._clock() - (self.state.waiting_since or self._clock())
+                    if waited >= self.cfg.max_gpu_wait_s:
+                        self._set(
+                            OFFLINE,
+                            f"No {wanted[0].replace('NVIDIA ', '')} came free on RunPod in "
+                            f"{_fmt_minutes(waited)} -- gave up so nothing starts billing while you "
+                            "are away. Press Start GPU to try again, or pick another GPU tier.",
+                            error=str(exc),
+                        )
+                        report()
+                        raise PodUnavailable(self.state.message) from exc
                     self._set(
                         WAITING_FOR_GPU,
-                        "No GPU available on RunPod right now -- waiting; processing starts "
-                        f"automatically when one frees up (checked every {int(self.cfg.retry_s)} s, "
-                        f"waiting {_fmt_minutes(waited)} so far).",
+                        "No GPU of this tier free on RunPod right now -- asking again every "
+                        f"{int(self.cfg.retry_s)} s (waiting {_fmt_minutes(waited)} of at most "
+                        f"{_fmt_minutes(self.cfg.max_gpu_wait_s)}). Nothing is billing yet.",
                         error=str(exc),
                     )
                     report()
@@ -335,6 +486,8 @@ class PodManager:
                         self._set(ERROR, f"RunPod rejected the API key: {exc}", error=str(exc))
                         report()
                         raise PodUnavailable(self.state.message) from exc
+                    if rp.is_low_balance_error(str(exc)):
+                        low_balance(exc)
                     if exc.status == 0:
                         # Network blip -- not evidence the GPU is gone. Try again shortly.
                         self._set(OFFLINE, f"Cannot reach RunPod ({exc}); retrying.", pod, error=str(exc))
@@ -408,17 +561,21 @@ class PodManager:
                 boot_started = self._clock() - pod.uptime_s
             booting_for = self._clock() - boot_started
             if booting_for > self.cfg.boot_cap_s:
+                # A pod that cannot boot will not boot on a second try either (2026-09-24: an
+                # expired token made EVERY new pod die the same way, and replacing them in a loop
+                # billed ~13 GPU-hours). Shut it down and tell the user; never recreate here.
+                stopped = self._shut_down(pod.id)
                 self._set(
-                    STARTING,
-                    f"GPU pod has been booting for {_fmt_minutes(booting_for)} without coming up -- "
-                    "replacing it.",
-                    pod,
+                    ERROR,
+                    f"The GPU pod did not finish starting in {_fmt_minutes(booting_for)} -- "
+                    + ("it has been stopped so it does not keep billing. " if stopped else
+                       "and RunPod did not stop it: stop it in the RunPod console now. ")
+                    + "Check the pod's logs in the RunPod console, then press Start GPU to try again.",
                     error="boot cap exceeded",
                 )
+                self.state.billing = not stopped
                 report()
-                self._terminate_and_wait(pod.id)
-                boot_started = None
-                continue
+                raise PodUnavailable(self.state.message)
             self._set(BOOTING, f"GPU pod is running; app starting ({_fmt_minutes(booting_for)} so far).", pod)
             report()
             wait(self.cfg.poll_s)
@@ -446,9 +603,29 @@ class PodManager:
         )
         return self.client.create_pod(body)
 
+    def _shut_down(self, pod_id: str) -> bool:
+        """Stop, then terminate, the pod; True once RunPod no longer has it running. Stop first
+        because RunPod refuses to DELETE a pod it has "locked" (seen 2026-09-24 on a crash-looping
+        pod, which then stayed up and billed) -- a stopped pod bills nothing for its GPU."""
+        try:
+            self.client.stop_pod(pod_id)
+        except RunPodError as exc:
+            if exc.status == 404:
+                return True
+            logger.warning("stop %s: %s", pod_id, exc)
+        self._terminate_and_wait(pod_id)
+        try:
+            pod = self.client.get_pod(pod_id)
+        except RunPodError as exc:
+            logger.warning("get_pod after shut-down: %s", exc)
+            return False
+        return pod is None or not pod.is_running
+
     def _terminate_and_wait(self, pod_id: str) -> None:
-        """DELETE the pod and wait until RunPod no longer lists it (the volume is untouched)."""
+        """DELETE the pod and wait until RunPod no longer lists it (the volume is untouched). If
+        RunPod will not delete it, at least stop it, so it cannot keep billing."""
         waited = 0.0
+        stop_tried = False
         while True:
             try:
                 self.client.terminate_pod(pod_id)
@@ -456,6 +633,12 @@ class PodManager:
                 if exc.status == 404:
                     return
                 logger.warning("terminate %s: %s", pod_id, exc)
+                if not stop_tried:
+                    stop_tried = True
+                    try:
+                        self.client.stop_pod(pod_id)
+                    except RunPodError as stop_exc:
+                        logger.warning("stop %s: %s", pod_id, stop_exc)
             self._sleep(self.cfg.poll_s)
             waited += self.cfg.poll_s
             try:

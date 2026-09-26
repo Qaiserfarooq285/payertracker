@@ -147,6 +147,45 @@ def fetch_gpu_offers(
     return offers
 
 
+def fetch_account(
+    api_key: str,
+    session: requests.Session | None = None,
+    timeout_s: float = REQUEST_TIMEOUT_S,
+) -> dict[str, float]:
+    """The account's credit balance and what it is being billed per hour right now (every pod +
+    the network volume), from RunPod's GraphQL `myself`. Shown next to the Start/Stop GPU buttons
+    (2026-09-26) so the owner can see at a glance whether anything is burning credit. Raises
+    `RunPodError` on any failure."""
+    http = session or requests
+    try:
+        resp = http.post(
+            GRAPHQL_URL,
+            params={"api_key": api_key},
+            json={"query": "{ myself { clientBalance currentSpendPerHr } }"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout_s,
+        )
+    except requests.RequestException as exc:
+        raise RunPodError(f"balance lookup failed: {exc}") from exc
+    if resp.status_code != 200:
+        raise RunPodError(f"balance lookup: HTTP {resp.status_code}", resp.status_code)
+    body = resp.json()
+    if body.get("errors"):
+        raise RunPodError(f"balance lookup: {body['errors'][0].get('message', body['errors'])}")
+    me = (body.get("data") or {}).get("myself") or {}
+    return {
+        "balance": float(me.get("clientBalance") or 0.0),
+        "spend_per_hr": float(me.get("currentSpendPerHr") or 0.0),
+    }
+
+
+def is_low_balance_error(message: str) -> bool:
+    """RunPod refuses to create/start a pod on an empty account with HTTP 500 "Your account
+    balance is too low to rent a pod" -- not a stock problem, and retrying cannot fix it."""
+    text = message.lower()
+    return "balance is too low" in text or "add funds" in text
+
+
 class RunPodError(Exception):
     """A RunPod REST call that did not succeed. `status` is the HTTP status (0 = no response)."""
 
@@ -179,8 +218,20 @@ def pod_create_body(
 
     The repo is private, so raw.githubusercontent.com needs the token too. `$GITHUB_TOKEN` is
     left for the container's shell to expand at boot, so the token never appears in the command.
+
+    When `env` carries `PV_GATEWAY_URL` + `PV_POD_KEY` (the VPS gateway sets both, 2026-09-26),
+    the bootstrap AND the code come from the gateway instead of GitHub: the fine-grained PAT the
+    pods used expired on ~2026-09-24, every new pod then died on this very first `curl`, and the
+    gateway kept recreating them -- ~13 GPU-hours billed with nothing running. The gateway always
+    has the exact deployed checkout, and its key never expires.
     """
-    fetch = f'curl -fsSL -H "Authorization: token $GITHUB_TOKEN" {BOOTSTRAP_URL}'
+    if env.get("PV_GATEWAY_URL") and env.get("PV_POD_KEY"):
+        fetch = (
+            'curl -fsSL --retry 5 --retry-delay 5 -H "X-PV-Pod-Key: $PV_POD_KEY" '
+            '"$PV_GATEWAY_URL/pod/bootstrap.sh"'
+        )
+    else:
+        fetch = f'curl -fsSL -H "Authorization: token $GITHUB_TOKEN" {BOOTSTRAP_URL}'
     if debug:
         # Keep the container alive after a failed bootstrap and leave its output on the volume,
         # so a crash-looping pod can be inspected over SSH instead of guessed at from a blank

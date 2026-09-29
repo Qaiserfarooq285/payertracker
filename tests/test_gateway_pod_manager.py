@@ -110,11 +110,13 @@ STOPPED_POD = {"id": "old1", "name": "pitchvision", "desiredStatus": "EXITED", "
 
 @pytest.fixture
 def make(monkeypatch):
-    def _make(fake: FakeRunPod, **cfg):
+    def _make(fake: FakeRunPod, code_bundle=None, pod_env=None, **cfg):
         monkeypatch.setattr(pm.rp, "probe_health", fake.probe)
         clock = FakeClock()
-        config = PodConfig(pod_env={"GITHUB_TOKEN": "t", "PV_ACCESS_PASSWORD": "p"}, poll_s=10, retry_s=60, **cfg)
-        mgr = PodManager(fake, config, clock=clock, sleep=clock.sleep)  # type: ignore[arg-type]
+        config = PodConfig(pod_env=pod_env or {"GITHUB_TOKEN": "t", "PV_ACCESS_PASSWORD": "p"},
+                           poll_s=10, retry_s=60, **cfg)
+        mgr = PodManager(fake, config, clock=clock, sleep=clock.sleep,  # type: ignore[arg-type]
+                         code_bundle=code_bundle)
         # What Start GPU does before it calls ensure_online (tests drive ensure_online directly).
         mgr.state.wanted = True
         return mgr, clock
@@ -425,3 +427,117 @@ def test_start_runs_on_a_thread_and_cannot_double_start(make):
     gate.set()
     mgr._start_thread.join(5)
     assert mgr.state.phase == pm.ONLINE
+
+
+# ---------------------------------------------------------------------------
+# The gateway pushes the code; a pod that stops itself mid-boot stays stopped (2026-09-30)
+# ---------------------------------------------------------------------------
+
+
+class FakeReceiver:
+    """The pod's docker/pod_receiver.py as the gateway sees it through RunPod's proxy: not
+    reachable for the first `ready_after` probes (the proxy has not registered the port), then
+    waiting until pushed. `restarts` = how many pushes a restarted container loses."""
+
+    def __init__(self, ready_after=0, refuse=0, restarts=0):
+        self.ready_after = ready_after
+        self.refuse = refuse
+        self.restarts = restarts
+        self.waiting = True
+        self.probes = 0
+        self.pushes: list[tuple[str, str, bytes, str]] = []
+
+    def awaits(self, url, session=None, timeout_s=None):
+        self.probes += 1
+        return self.waiting and self.probes > self.ready_after
+
+    def push(self, url, key, bundle, commit, session=None, timeout_s=None):
+        if self.refuse:
+            raise RunPodError(f"the pod refused the code: HTTP {self.refuse} bad pod key", self.refuse)
+        self.pushes.append((url, key, bundle, commit))
+        if self.restarts:
+            self.restarts -= 1  # the container restarted: it is waiting for the code again
+        else:
+            self.waiting = False
+        return True
+
+
+@pytest.fixture
+def pushing(make, monkeypatch):
+    def _pushing(fake: FakeRunPod, receiver: FakeReceiver | None = None, code_bundle=None, **cfg):
+        receiver = receiver or FakeReceiver()
+        mgr, clock = make(fake, code_bundle=code_bundle or (lambda: (b"TGZ", "abc123def456")),
+                          pod_env={"PV_POD_KEY": "key", "PV_ACCESS_PASSWORD": "p"}, **cfg)
+        monkeypatch.setattr(pm.rp, "pod_awaits_code", receiver.awaits)
+        monkeypatch.setattr(pm.rp, "push_code", receiver.push)
+        # the app can only answer /api/health once it has its code
+        monkeypatch.setattr(pm.rp, "probe_health",
+                            lambda url, session=None, timeout_s=None: None if receiver.waiting else fake.probe(url))
+        return mgr, clock, receiver
+
+    return _pushing
+
+
+def test_a_booting_pod_is_handed_its_code_then_comes_online(pushing):
+    fake = FakeRunPod([], healthy_after_polls=2)
+    mgr, clock, receiver = pushing(fake, FakeReceiver(ready_after=3))
+    messages = []
+    st = mgr.ensure_online(lambda ph, msg: messages.append(msg))
+    assert st.phase == pm.ONLINE and st.pod_id == "new1"
+    assert receiver.pushes == [("https://new1-8000.proxy.runpod.net", "key", b"TGZ", "abc123def456")]
+    booting = [m for m in messages if m.startswith("GPU pod is running")]
+    assert "sending it the app code" in booting[0] and "code received, app starting" in booting[-1]
+
+
+def test_a_pod_that_stops_itself_mid_boot_is_shut_down_not_started_again(pushing):
+    """2026-09-30: the pod's code fetch timed out for 13 min, the pod stopped itself, and the
+    gateway STARTED it again -- resetting the boot cap too, so it would have looped on the bill
+    with nothing to show. A pod seen running in this start and then found stopped stays down."""
+    fake = FakeRunPod([], healthy_after_polls=10**9)
+    mgr, clock, receiver = pushing(fake, FakeReceiver(ready_after=10**9))  # the code never lands
+    real_find = fake.find_pod
+    finds = {"n": 0}
+
+    def find_then_stop_itself(name):
+        finds["n"] += 1
+        if finds["n"] == 5 and "new1" in fake.pods:
+            fake.pods["new1"]["desiredStatus"] = "EXITED"  # the pod's own `|| stop-self`
+        return real_find(name)
+
+    fake.find_pod = find_then_stop_itself
+    with pytest.raises(PodUnavailable):
+        mgr.ensure_online()
+    assert mgr.state.phase == pm.ERROR and "stopped itself" in mgr.state.message
+    assert not any(c.startswith("start:") for c in fake.calls)
+    assert fake.calls.count("create") == 1 and "terminate:new1" in fake.calls
+    assert mgr.state.wanted is False and mgr.state.billing is False
+
+
+def test_a_pod_that_refuses_its_code_is_shut_down(pushing):
+    fake = FakeRunPod([])
+    mgr, clock, receiver = pushing(fake, FakeReceiver(refuse=403))
+    with pytest.raises(PodUnavailable):
+        mgr.ensure_online()
+    assert mgr.state.phase == pm.ERROR and "Could not hand the GPU pod its code" in mgr.state.message
+    assert "HTTP 403" in mgr.state.message
+    assert "stop:new1" in fake.calls and "terminate:new1" in fake.calls
+    assert mgr.state.wanted is False and mgr.state.billing is False
+
+
+def test_code_that_cannot_be_packaged_shuts_the_pod_down(pushing):
+    def broken_bundle():
+        raise OSError("git: not a repository")
+
+    fake = FakeRunPod([])
+    mgr, clock, receiver = pushing(fake, code_bundle=broken_bundle)
+    with pytest.raises(PodUnavailable):
+        mgr.ensure_online()
+    assert mgr.state.phase == pm.ERROR and "packaging it failed" in mgr.state.message
+    assert "terminate:new1" in fake.calls and receiver.pushes == []
+
+
+def test_a_restarted_container_is_handed_the_code_again(pushing):
+    fake = FakeRunPod([], healthy_after_polls=1)
+    mgr, clock, receiver = pushing(fake, FakeReceiver(restarts=1))
+    st = mgr.ensure_online()
+    assert st.phase == pm.ONLINE and len(receiver.pushes) == 2

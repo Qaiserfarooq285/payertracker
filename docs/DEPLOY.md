@@ -131,10 +131,18 @@ browser ──https──▶ KVM VPS: nginx (TLS) ──▶ gateway :8100 (apps/
 - Once the pod answers `/api/health` the gateway pushes the video (skipped when the volume already
   has it), starts the pipeline and mirrors its progress/results/media back to the browser. The job
   log carries the pipeline's real progress lines, so a long video no longer looks frozen.
-- **Pods get their code from the gateway**, not GitHub: `/pod/bootstrap.sh` + `/pod/code.tar.gz`
-  (a tarball of the VPS checkout), authorised by a key derived from the site password. An expired
-  GitHub token (what happened on 2026-09-24 — every new pod died at its first command) can no
-  longer stop a pod from booting.
+- **The gateway pushes the code to each new pod**, through the same RunPod proxy it uses for
+  everything else. A pod's start command first runs `docker/pod_receiver.py` (it travels in the pod's
+  env, `PV_POD_RECEIVER`), which waits on port 8000; the gateway sends it a tarball of the VPS checkout,
+  checked against a key derived from the site password, and the pod runs the bundle's
+  `docker/runpod_bootstrap.sh`. Neither GitHub nor a token that can expire is in the path (an expired
+  one killed every new pod on 2026-09-24). **A pod never calls the VPS**: a pod in EUR-IS-1 cannot open
+  a connection to it at all (measured 2026-09-30 — the first real run of the old "pod downloads from
+  the gateway" design hung in `curl` for 13 min per try).
+- **A pod that stops itself while booting stays stopped.** It stops itself when no code arrives in
+  15 min or the bootstrap/app fails; the gateway then reports the failure and terminates it. It never
+  starts it again, because on 2026-09-30 the stop-self → restart → stop-self loop billed an A100 with
+  nothing running (every restart also reset the 20-min boot cap).
 - The queue is persisted (`/var/lib/pitchvision/jobs.json`): a refreshed page — or a rebooted VPS —
   picks up where it was. Jobs run one at a time.
 - Because the pod is found **by name**, nothing ever needs re-pointing when its id changes.

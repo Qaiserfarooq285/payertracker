@@ -460,24 +460,37 @@ def test_pod_state_carries_balance_and_idle_settings(gw, monkeypatch):
     assert data["pod"]["wanted"] is False and data["pod"]["billing"] is False
 
 
-def test_pods_fetch_code_with_the_key_only(gw):
+def test_code_bundle_is_the_deployed_checkout(gw):
+    """What a booting pod is handed (2026-09-30: pushed through RunPod's proxy, because a pod
+    cannot reach the VPS): a tar.gz of the committed checkout, bootstrap included."""
+    import tarfile
+
     client, main = gw
-    assert client.get("/pod/bootstrap.sh").status_code == 403
-    assert client.get("/pod/code.tar.gz", headers={"X-PV-Pod-Key": "nope"}).status_code == 403
-    key = {"X-PV-Pod-Key": main.pod_bootstrap_key()}
-    boot = client.get("/pod/bootstrap.sh", headers=key)
-    assert boot.status_code == 200 and "PV_GATEWAY_URL" in boot.text
-    code = client.get("/pod/code.tar.gz", headers=key)
-    assert code.status_code == 200 and code.content[:2] == b"\x1f\x8b"  # gzip
-    assert len(code.headers["x-pv-commit"]) == 12
+    bundle, commit = main.code_bundle()
+    assert bundle[:2] == b"\x1f\x8b" and len(commit) == 12
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        names = set(tf.getnames())
+    assert {"docker/runpod_bootstrap.sh", "start_app.py", "apps/api/main.py"} <= names
+    assert main.code_bundle() == (bundle, commit)  # cached per commit
 
 
-def test_pod_create_body_uses_the_gateway_when_configured():
-    env = {"PV_GATEWAY_URL": "https://gw", "PV_POD_KEY": "k"}
+def test_pods_are_told_to_wait_for_the_code_not_to_fetch_it(gw):
+    client, main = gw
+    env = main.PODS.cfg.pod_env
+    assert env["PV_POD_KEY"] == main.pod_bootstrap_key()
+    assert env["PV_POD_RECEIVER"] == main_rp.pod_receiver_env()
+    assert "PV_GATEWAY_URL" not in env and "GITHUB_TOKEN" not in env
+    # the old pull endpoints are gone: nothing on the gateway serves code any more
+    assert client.get("/pod/bootstrap.sh", headers={"X-PV-Pod-Key": env["PV_POD_KEY"]}).status_code == 404
+    assert client.get("/pod/code.tar.gz", headers={"X-PV-Pod-Key": env["PV_POD_KEY"]}).status_code == 404
+
+
+def test_pod_create_body_waits_for_the_pushed_code():
+    env = {"PV_POD_RECEIVER": main_rp.pod_receiver_env(), "PV_POD_KEY": "k"}
     body = main_rp.pod_create_body(name="p", gpu_type_ids=["x"], volume_id="v", env=env)
     cmd = body["dockerStartCmd"][-1]
-    assert "$PV_GATEWAY_URL/pod/bootstrap.sh" in cmd and "GITHUB_TOKEN" not in cmd
-    # a failed fetch/bootstrap/app stops the pod itself rather than crash-looping on the bill
+    assert "PV_POD_RECEIVER" in cmd and "curl -fsSL" not in cmd and "GITHUB_TOKEN" not in cmd
+    # missing code / a failed bootstrap / a failed app stops the pod itself, never a billing loop
     assert "|| {" in cmd and "/pods/$RUNPOD_POD_ID/stop" in cmd and "| bash" not in cmd
     legacy = main_rp.pod_create_body(name="p", gpu_type_ids=["x"], volume_id="v", env={})
     assert "raw.githubusercontent.com" in legacy["dockerStartCmd"][-1]

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # PitchVision -- ship this checkout's master to the VPS gateway (docs/DEPLOY.md "Always-on gateway").
 # The code travels as a `git bundle` over SSH (2026-09-26), so neither the VPS nor the pods need a
-# GitHub token any more; the pod side needs nothing -- it fetches its code from the gateway on its
-# next Start GPU. Run from the owner's Mac after committing (and `git push`, to keep GitHub level):
+# GitHub token any more; the pod side needs nothing -- the gateway pushes it the code on its next
+# Start GPU. Run from the owner's Mac after committing (and `git push`, to keep GitHub level):
 #
 #   bash docker/deploy_vps.sh
 #

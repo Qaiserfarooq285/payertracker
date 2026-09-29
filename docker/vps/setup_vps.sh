@@ -68,7 +68,7 @@ for name in GITHUB_TOKEN RUNPOD_API_KEY PV_ACCESS_PASSWORD PV_POD_SSH_PUBLIC_KEY
   if [ -n "${!name:-}" ]; then set_env "$name" "${!name}"; fi
 done
 grep -q '^PV_GATEWAY_DATA=' "$ENV_FILE" || set_env PV_GATEWAY_DATA "$DATA_DIR"
-# Pods fetch their code from this gateway's public URL (apps/gateway/main.py `/pod/*`).
+# Informational since 2026-09-30: the gateway pushes each pod its code through RunPod's proxy.
 set_env PV_PUBLIC_URL "https://$DOMAIN"
 for required in RUNPOD_API_KEY PV_ACCESS_PASSWORD; do
   grep -q "^${required}=." "$ENV_FILE" || { log "$required is not set (pass it on the command line)"; exit 1; }

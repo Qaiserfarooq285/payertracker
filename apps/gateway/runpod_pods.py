@@ -14,12 +14,19 @@ RunPod REST quirks learned the hard way (2026-09-17):
   * Cloudflare (error 1010) rejects urllib's / requests' default User-Agent -- set our own.
   * The `<id>-<port>.proxy.runpod.net` host answers a stopped pod, and a booting one whose port
     isn't registered yet, with an EMPTY 404 -- not a 502.
+And one about the network (2026-09-30): a pod in EUR-IS-1 cannot open a TCP connection to the
+Hostinger VPS at all (nor the VPS to the pod's public IP) -- only RunPod's proxy connects them.
+So the gateway PUSHES the code to a booting pod through that proxy (`push_code`); a pod never
+calls the gateway.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
+import zlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -30,14 +37,21 @@ REST_BASE = "https://rest.runpod.io/v1"
 USER_AGENT = "pitchvision-gateway/1.0"
 REQUEST_TIMEOUT_S = 60.0
 HEALTH_TIMEOUT_S = 15.0
+CODE_PUSH_TIMEOUT_S = 120.0
 
-# What a PitchVision pod is made of. `docker/runpod_bootstrap.sh` is fetched on every boot from
-# the (private) repo with the pod's GITHUB_TOKEN and runs the app; the network volume at
+# What a PitchVision pod is made of. On every boot the pod first runs `docker/pod_receiver.py`
+# (shipped in its env as `PV_POD_RECEIVER`), which waits on the app port for the gateway to push
+# the code; the code's `docker/runpod_bootstrap.sh` then runs the app. The network volume at
 # /workspace carries the checkout, venv, models, uploads and outputs across pod recreations.
+# (`docker/runpod_provision.py` without a gateway still fetches from GitHub with a GITHUB_TOKEN.)
 IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 BOOTSTRAP_URL = (
     "https://raw.githubusercontent.com/Qaiserfarooq285/payertracker/master/docker/runpod_bootstrap.sh"
 )
+POD_RECEIVER_SCRIPT = Path(__file__).resolve().parents[2] / "docker" / "pod_receiver.py"
+CODE_PUSH_PATH = "/pv/code"  # docker/pod_receiver.py CODE_PATH
+POD_CODE_TGZ = "/tmp/pv-code.tar.gz"
+POD_BOOTSTRAP = "/tmp/pv-bootstrap.sh"
 CONTAINER_DISK_GB = 20
 VOLUME_MOUNT_PATH = "/workspace"
 DEFAULT_POD_NAME = "pitchvision"
@@ -202,6 +216,13 @@ def proxy_url(pod_id: str, port: int = DEFAULT_PORT) -> str:
     return f"https://{pod_id}-{port}.proxy.runpod.net"
 
 
+def pod_receiver_env() -> str:
+    """`docker/pod_receiver.py`, zlib-compressed and base64-encoded, for the pod's
+    `PV_POD_RECEIVER` env var -- the start command decompresses and execs it (`pod_create_body`).
+    It travels in the pod spec because a booting pod has no other way to get code."""
+    return base64.b64encode(zlib.compress(POD_RECEIVER_SCRIPT.read_bytes(), 9)).decode("ascii")
+
+
 def pod_create_body(
     *,
     name: str,
@@ -213,47 +234,47 @@ def pod_create_body(
     debug: bool = False,
 ) -> dict[str, Any]:
     """The `POST /pods` payload for a PitchVision pod. `env` must already carry the secrets the
-    bootstrap needs (`GITHUB_TOKEN`, `PV_ACCESS_PASSWORD`, optional `RUNPOD_API_KEY` for idle
-    auto-stop, `PUBLIC_KEY` for SSH).
+    bootstrap needs (`PV_ACCESS_PASSWORD`, optional `RUNPOD_API_KEY` for idle auto-stop,
+    `PUBLIC_KEY` for SSH) and says where the code comes from:
 
-    The repo is private, so raw.githubusercontent.com needs the token too. `$GITHUB_TOKEN` is
-    left for the container's shell to expand at boot, so the token never appears in the command.
-
-    When `env` carries `PV_GATEWAY_URL` + `PV_POD_KEY` (the VPS gateway sets both, 2026-09-26),
-    the bootstrap AND the code come from the gateway instead of GitHub: the fine-grained PAT the
-    pods used expired on ~2026-09-24, every new pod then died on this very first `curl`, and the
-    gateway kept recreating them -- ~13 GPU-hours billed with nothing running. The gateway always
-    has the exact deployed checkout, and its key never expires.
+    * `PV_POD_RECEIVER` + `PV_POD_KEY` (what the VPS gateway sets, 2026-09-30): the pod waits for
+      the gateway to PUSH the code through RunPod's proxy (`docker/pod_receiver.py`,
+      `push_code`). A pod cannot reach the VPS itself -- the 2026-09-26 design had it fetch from
+      the gateway's public URL, and on its first real run every fetch timed out.
+    * otherwise (`docker/runpod_provision.py` by hand): fetch the bootstrap from the private repo
+      with `GITHUB_TOKEN`, left for the container's shell to expand so it never appears in the
+      command.
     """
-    if env.get("PV_GATEWAY_URL") and env.get("PV_POD_KEY"):
-        fetch = (
-            'curl -fsSL --retry 5 --retry-delay 5 -H "X-PV-Pod-Key: $PV_POD_KEY" '
-            '"$PV_GATEWAY_URL/pod/bootstrap.sh"'
+    if env.get("PV_POD_RECEIVER") and env.get("PV_POD_KEY"):
+        get_code = (
+            f"export PV_CODE_TGZ={POD_CODE_TGZ} PV_BOOTSTRAP={POD_BOOTSTRAP}; "
+            "python3 -c 'import base64,os,zlib; "
+            'exec(zlib.decompress(base64.b64decode(os.environ["PV_POD_RECEIVER"])))\''
         )
     else:
-        fetch = f'curl -fsSL -H "Authorization: token $GITHUB_TOKEN" {BOOTSTRAP_URL}'
+        get_code = f'curl -fsSL -H "Authorization: token $GITHUB_TOKEN" {BOOTSTRAP_URL} -o {POD_BOOTSTRAP}'
     if debug:
         # Keep the container alive after a failed bootstrap and leave its output on the volume,
         # so a crash-looping pod can be inspected over SSH instead of guessed at from a blank
         # log viewer.
         start_cmd = (
             "/start.sh >/workspace/runpod-start.log 2>&1 & export PV_SKIP_RUNPOD_SERVICES=1; "
-            f"{fetch} -o /workspace/bootstrap.sh && "
-            "bash /workspace/bootstrap.sh >/workspace/bootstrap.log 2>&1; "
+            f"{get_code} && bash {POD_BOOTSTRAP} >/workspace/bootstrap.log 2>&1; "
             "echo EXIT=$? >>/workspace/bootstrap.log; sleep infinity"
         )
     else:
-        # If the bootstrap cannot be fetched, fails, or the app exits with an error, the pod STOPS
-        # ITSELF (RunPod injects RUNPOD_POD_ID; the gateway passes RUNPOD_API_KEY) instead of
-        # letting RunPod restart the container in a billing loop -- a guard that does not depend
-        # on the gateway being up. (`curl | bash` hid a failed fetch: bash exits 0 on no input.)
+        # If the code never arrives, the bootstrap fails, or the app exits with an error, the pod
+        # STOPS ITSELF (RunPod injects RUNPOD_POD_ID; the gateway passes RUNPOD_API_KEY) instead
+        # of letting RunPod restart the container in a billing loop -- a guard that does not
+        # depend on the gateway being up. (`curl | bash` hid a failed fetch: bash exits 0 on no
+        # input.) The gateway, for its part, never starts a pod that stopped itself mid-boot.
         stop_self = (
             'echo "[pitchvision] bootstrap/app failed -- stopping this pod so it does not bill"; '
             '[ -n "$RUNPOD_API_KEY" ] && [ -n "$RUNPOD_POD_ID" ] && curl -fsS -X POST '
             '-H "Authorization: Bearer $RUNPOD_API_KEY" -H "Content-Type: application/json" '
             f"-A {USER_AGENT} -d '{{}}' \"{REST_BASE}/pods/$RUNPOD_POD_ID/stop\"; sleep 60"
         )
-        start_cmd = f"{fetch} -o /tmp/pv-bootstrap.sh && bash /tmp/pv-bootstrap.sh || {{ {stop_self}; }}"
+        start_cmd = f"{get_code} && bash {POD_BOOTSTRAP} || {{ {stop_self}; }}"
     return {
         "name": name,
         "imageName": IMAGE,
@@ -388,6 +409,46 @@ class RunPodClient:
 
     def create_volume(self, name: str, size_gb: int, datacenter: str) -> dict[str, Any]:
         return self._call("POST", "/networkvolumes", {"name": name, "size": size_gb, "dataCenterId": datacenter})
+
+
+def pod_awaits_code(url: str, session: requests.Session | None = None, timeout_s: float = HEALTH_TIMEOUT_S) -> bool:
+    """Is the pod's receiver (`docker/pod_receiver.py`) up and still waiting for the code? False
+    while RunPod's proxy has not registered the port, while the bootstrap installs (nothing
+    listens), once the app runs (its own 401/404), and on any network error."""
+    sess = session or requests.Session()
+    try:
+        resp = sess.get(f"{url.rstrip('/')}{CODE_PUSH_PATH}", timeout=timeout_s, headers={"User-Agent": USER_AGENT})
+        return resp.status_code == 200 and resp.json().get("awaiting") is True
+    except (requests.RequestException, ValueError, AttributeError):
+        return False
+
+
+def push_code(
+    url: str,
+    key: str,
+    bundle: bytes,
+    commit: str,
+    session: requests.Session | None = None,
+    timeout_s: float = CODE_PUSH_TIMEOUT_S,
+) -> bool:
+    """Hand a waiting pod its code (the gateway's `git archive` tar.gz) through RunPod's proxy.
+    True once the pod accepted it; False on a network error or a proxy hiccup (the caller asks
+    again on its next poll). Raises `RunPodError` when the pod REFUSES the bundle -- wrong key,
+    not a bundle -- which asking again cannot fix."""
+    sess = session or requests.Session()
+    headers = {"User-Agent": USER_AGENT, "X-PV-Pod-Key": key, "X-PV-Commit": commit,
+               "Content-Type": "application/gzip"}
+    try:
+        resp = sess.post(f"{url.rstrip('/')}{CODE_PUSH_PATH}", data=bundle, timeout=timeout_s, headers=headers)
+    except requests.RequestException as exc:
+        logger.warning("code push to %s failed: %s", url, exc)
+        return False
+    if resp.status_code == 200:
+        return True
+    if resp.status_code in (400, 403, 413):
+        raise RunPodError(f"the pod refused the code: HTTP {resp.status_code} {resp.text[:200]}", resp.status_code)
+    logger.warning("code push to %s: HTTP %s", url, resp.status_code)
+    return False
 
 
 def probe_health(url: str, session: requests.Session | None = None, timeout_s: float = HEALTH_TIMEOUT_S) -> dict | None:

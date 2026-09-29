@@ -19,17 +19,16 @@ isn't; what doesn't (uploads, the video list, the queue) is answered here.
 The GPU is the USER's to switch on and off (2026-09-26, after the old auto-wake/auto-recreate
 policy burned the credit): `POST /api/pod/start` and `POST /api/pod/stop` are the only things
 that start or stop it, plus an idle auto-stop (`PV_GPU_IDLE_MINUTES`, default 10) that only ever
-STOPS. Pods fetch their bootstrap + code from this gateway (`/pod/*`), not from GitHub, so an
-expired GitHub token can no longer leave pods that never boot.
+STOPS. A booting pod gets its code from this gateway -- PUSHED to it through RunPod's proxy
+(`code_bundle` + `pod_manager._deliver_code`), because a pod cannot open a connection to this VPS
+at all (2026-09-30) -- so neither GitHub nor a token that can expire is in the path.
 
 Configuration is environment only (docker/vps/gateway.env.example):
     PV_ACCESS_PASSWORD   the shared login (same value on the pod)
     RUNPOD_API_KEY       pods read/write -- the gateway starts, creates and terminates the pod
-    GITHUB_TOKEN         read-only PAT the pod uses to fetch the private repo at boot
-    PV_GATEWAY_DATA      state dir (uploads + jobs.json), default /var/lib/pitchvision
+    PV_GATEWAY_DATA      state dir (uploads + jobs.json + the code bundle), default /var/lib/pitchvision
     PV_POD_NAME / PV_VOLUME_NAME / PV_DATACENTER / PV_GPU_TYPES / PV_POD_PORT
     PV_POD_SSH_PUBLIC_KEY, GEMINI_API_KEY, PV_IDLE_STOP_MINUTES   passed through to the pod
-    PV_PUBLIC_URL        this gateway's public https URL; pods fetch their code from it
     PV_GPU_IDLE_MINUTES  stop a billing pod after this long with no job and no use (0 = never)
 """
 
@@ -71,7 +70,6 @@ INPUT_DIR = DATA_DIR / "input"
 JOBS_FILE = DATA_DIR / "jobs.json"
 STATE_REFRESH_S = float(os.environ.get("PV_POD_REFRESH_SECONDS", "30"))
 GPU_IDLE_S = float(os.environ.get("PV_GPU_IDLE_MINUTES", "10")) * 60.0
-BOOTSTRAP_SCRIPT = BASE_DIR / "docker" / "runpod_bootstrap.sh"
 
 app = FastAPI(title="The Reach Vision gateway")
 
@@ -84,11 +82,32 @@ def _env(name: str, default: str = "") -> str:
 
 
 def pod_bootstrap_key() -> str:
-    """What a pod presents to fetch `/pod/bootstrap.sh` + `/pod/code.tar.gz`. Derived from secrets
-    the gateway already has, so it needs no storage and changes when they are rotated."""
+    """What the gateway presents when it pushes the code to a booting pod (the pod checks it
+    against its own `PV_POD_KEY`, docker/pod_receiver.py). Derived from secrets the gateway
+    already has, so it needs no storage and changes when they are rotated."""
     password, _ = resolve_access_password(os.environ.get("PV_ACCESS_PASSWORD"))
     secret = (password or _env("RUNPOD_API_KEY") or "pitchvision").encode("utf-8")
     return hmac.new(secret, b"pv-pod-bootstrap", hashlib.sha256).hexdigest()[:40]
+
+
+_CODE_LOCK = threading.Lock()
+
+
+def code_bundle() -> tuple[bytes, str]:
+    """The gateway's own checkout -- exactly what is deployed -- as the tar.gz a booting pod is
+    handed (`runpod_pods.push_code`), and its short commit. Cached per commit."""
+    with _CODE_LOCK:
+        sha = subprocess.run(["git", "-C", str(BASE_DIR), "rev-parse", "HEAD"], capture_output=True,
+                             text=True, check=True, timeout=30).stdout.strip()
+        target = DATA_DIR / f"code-{sha[:12]}.tar.gz"
+        if not target.exists():
+            for old in DATA_DIR.glob("code-*.tar.gz"):
+                old.unlink(missing_ok=True)
+            tmp = target.with_suffix(".tmp")
+            subprocess.run(["git", "-C", str(BASE_DIR), "archive", "--format=tar.gz", "-o", str(tmp), sha],
+                           check=True, timeout=120)
+            os.replace(tmp, target)
+        return target.read_bytes(), sha[:12]
 
 
 def pod_config_from_env() -> PodConfig:
@@ -98,17 +117,16 @@ def pod_config_from_env() -> PodConfig:
         "PV_ACCESS_PASSWORD": password or "off",
         "PV_IDLE_STOP_MINUTES": _env("PV_IDLE_STOP_MINUTES", "30"),
         "PORT": _env("PV_POD_PORT", str(rp.DEFAULT_PORT)),
+        # The pod waits for this gateway to push its code (runpod_pods.pod_create_body).
+        "PV_POD_KEY": pod_bootstrap_key(),
+        "PV_POD_RECEIVER": rp.pod_receiver_env(),
     }
     # The pod stops itself when idle with the same key (apps/api/idle_stop.py).
     if api_key:
         pod_env["RUNPOD_API_KEY"] = api_key
-    for src, dst in (("GITHUB_TOKEN", "GITHUB_TOKEN"), ("GEMINI_API_KEY", "GEMINI_API_KEY"), ("PV_POD_SSH_PUBLIC_KEY", "PUBLIC_KEY")):
+    for src, dst in (("GEMINI_API_KEY", "GEMINI_API_KEY"), ("PV_POD_SSH_PUBLIC_KEY", "PUBLIC_KEY")):
         if _env(src):
             pod_env[dst] = _env(src)
-    # Code comes from this gateway when it knows its own public URL (runpod_pods.pod_create_body).
-    if _env("PV_PUBLIC_URL"):
-        pod_env["PV_GATEWAY_URL"] = _env("PV_PUBLIC_URL").rstrip("/")
-        pod_env["PV_POD_KEY"] = pod_bootstrap_key()
     gpu_types = tuple(g.strip() for g in _env("PV_GPU_TYPES").split(",") if g.strip()) or rp.DEFAULT_GPU_TYPES
     return PodConfig(
         name=_env("PV_POD_NAME", rp.DEFAULT_POD_NAME),
@@ -125,12 +143,10 @@ if ACCESS_PASSWORD_IS_DEFAULT:
     logger.warning("using the default access password (%s) -- set PV_ACCESS_PASSWORD", DEFAULT_ACCESS_PASSWORD)
 if not _env("RUNPOD_API_KEY"):
     logger.warning("RUNPOD_API_KEY is not set -- the gateway cannot start or create the pod")
-if not _env("PV_PUBLIC_URL") and not _env("GITHUB_TOKEN"):
-    logger.warning("neither PV_PUBLIC_URL nor GITHUB_TOKEN is set -- a new pod could not fetch the code")
 
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-PODS = PodManager(rp.RunPodClient(_env("RUNPOD_API_KEY")), pod_config_from_env())
+PODS = PodManager(rp.RunPodClient(_env("RUNPOD_API_KEY")), pod_config_from_env(), code_bundle=code_bundle)
 POD_CLIENT = PodClient(lambda: PODS.proxy_url if PODS.online else "", ACCESS_PASSWORD)
 JOBS = JobStore(JOBS_FILE)
 WORKER = JobWorker(JOBS, PODS, POD_CLIENT, INPUT_DIR)
@@ -161,8 +177,7 @@ _SESSION_COOKIE = "pv_session"
 _SESSION_KEY = secrets.token_bytes(32)
 _SESSION_MAX_AGE_S = 30 * 24 * 3600
 _LOGIN_FAIL_DELAY_S = 0.5
-# `/pod/` is fetched by the pod at boot and checks its own key (`_check_pod_key`).
-_PUBLIC_PATH_PREFIXES = ("/api/health", "/api/login", "/api/auth/status", "/pod/")
+_PUBLIC_PATH_PREFIXES = ("/api/health", "/api/login", "/api/auth/status")
 _PUBLIC_STATIC_PREFIXES = ("/css/", "/js/", "/assets/", "/favicon")  # the login card needs the logo
 
 
@@ -299,44 +314,6 @@ def stop_pod():
 
     threading.Thread(target=run, name="gateway-pod-stop", daemon=True).start()
     return {"status": "stopping", "cancelled_jobs": cancelled}
-
-
-# ---------------------------------------------------------------- what a booting pod fetches
-
-
-def _check_pod_key(request: Request) -> None:
-    if not hmac.compare_digest(request.headers.get("x-pv-pod-key", ""), pod_bootstrap_key()):
-        raise HTTPException(status_code=403, detail="bad pod key")
-
-
-@app.get("/pod/bootstrap.sh")
-def pod_bootstrap(request: Request):
-    _check_pod_key(request)
-    return FileResponse(BOOTSTRAP_SCRIPT, media_type="text/x-shellscript")
-
-
-_CODE_LOCK = threading.Lock()
-
-
-@app.get("/pod/code.tar.gz")
-def pod_code(request: Request):
-    """The gateway's own checkout (exactly what is deployed) as a tarball, cached per commit."""
-    _check_pod_key(request)
-    with _CODE_LOCK:
-        try:
-            sha = subprocess.run(["git", "-C", str(BASE_DIR), "rev-parse", "HEAD"], capture_output=True,
-                                 text=True, check=True, timeout=30).stdout.strip()
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise HTTPException(status_code=500, detail=f"no git checkout to serve: {exc}") from exc
-        target = DATA_DIR / f"code-{sha[:12]}.tar.gz"
-        if not target.exists():
-            for old in DATA_DIR.glob("code-*.tar.gz"):
-                old.unlink(missing_ok=True)
-            tmp = target.with_suffix(".tmp")
-            subprocess.run(["git", "-C", str(BASE_DIR), "archive", "--format=tar.gz", "-o", str(tmp), sha],
-                           check=True, timeout=120)
-            os.replace(tmp, target)
-    return FileResponse(target, media_type="application/gzip", headers={"X-PV-Commit": sha[:12]})
 
 
 # GPU tiers with RunPod's live per-hour price and per-datacenter stock (2026-09-19). One GraphQL

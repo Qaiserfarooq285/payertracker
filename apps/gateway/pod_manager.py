@@ -16,9 +16,13 @@ until the balance hit zero, then reported the refusals as "No GPU available". So
                          then give up (a GPU appearing hours later must not start billing then)
     balance too low   -> ERROR at once, with the reason -- retrying cannot fix it
     pod stopped       -> Start; if RunPod refuses (GPU taken) -> terminate it, then create
-    pod running       -> wait for /api/health (BOOTING); a boot that is not up within
-                         `boot_cap_s` is STOPPED + terminated and reported -- never recreated
-                         in a loop
+    pod running       -> push it the code (`code_bundle`, through RunPod's proxy -- a pod cannot
+                         reach the VPS, 2026-09-30), then wait for /api/health (BOOTING); a boot
+                         that is not up within `boot_cap_s` is STOPPED + terminated and reported
+                         -- never recreated in a loop
+    stopped mid-boot  -> the pod stopped ITSELF (its start-up failed) or someone stopped it in the
+                         RunPod console: shut it down and report -- never Start it again (that
+                         loop billed an A100 for nothing on 2026-09-30)
 
 Every transition is reported through `on_progress(phase, message)`. `stop()` interrupts a start
 in progress (the waits are on a cancel event), and `idle_check()` stops a billing pod nobody has
@@ -159,9 +163,14 @@ class PodManager:
         health_session: requests.Session | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] | None = None,
+        code_bundle: Callable[[], tuple[bytes, str]] | None = None,
     ):
         self.client = client
         self.cfg = config
+        # (tar.gz bytes, commit) of the code a booting pod is handed; None = the pod gets its code
+        # itself (`docker/runpod_provision.py`'s GitHub path). Used only with PV_POD_KEY in pod_env.
+        self._code_bundle = code_bundle
+        self._code_sent_to = ""  # the pod id that last accepted the code
         self._health_session = health_session or requests.Session()
         self._clock = clock
         # `stop()` sets this; every wait inside a start returns early on it.
@@ -384,6 +393,7 @@ class PodManager:
         last_reported: tuple[str, str] | None = None
         boot_started: float | None = None
         no_gpu_replacements = 0
+        seen_running = ""  # a pod this call has seen RUNNING with a GPU
 
         def report() -> None:
             nonlocal last_reported
@@ -479,6 +489,24 @@ class PodManager:
 
             # --- pod exists but is stopped: Start, or tear down if its GPU is gone ----------
             if not pod.is_running:
+                if pod.id == seen_running:
+                    # It was RUNNING earlier in this start and nothing here stopped it: it stopped
+                    # ITSELF (no code arrived, the bootstrap or the app failed --
+                    # runpod_pods.pod_create_body) or someone stopped it in the RunPod console.
+                    # Starting it again is the loop that billed an A100 for nothing on 2026-09-30,
+                    # and every restart reset the boot cap. Shut it down and tell the user.
+                    stopped = self._shut_down(pod.id)
+                    self._set(
+                        ERROR,
+                        "The GPU pod stopped itself while starting up (its start-up failed) -- "
+                        + ("it has been shut down, nothing is billing. " if stopped else
+                           "and RunPod did not remove it: stop it in the RunPod console now. ")
+                        + "Check the pod's logs in the RunPod console, then press Start GPU to try again.",
+                        error="pod stopped during boot",
+                    )
+                    self.state.billing = not stopped
+                    report()
+                    raise PodUnavailable(self.state.message)
                 try:
                     pod = self.client.start_pod(pod.id)
                 except RunPodError as exc:
@@ -537,6 +565,7 @@ class PodManager:
                 self._terminate_and_wait(pod.id)
                 boot_started = None
                 continue
+            seen_running = pod.id
             health = rp.probe_health(rp.proxy_url(pod.id, self.cfg.port), self._health_session)
             if health and not health.get("gpu_available", True):
                 # The app itself is the last word: no CUDA device means no GPU, whatever RunPod says.
@@ -556,6 +585,19 @@ class PodManager:
                 self._mark_online(pod, health)
                 report()
                 return self.state
+            problem = self._deliver_code(pod)
+            if problem:
+                stopped = self._shut_down(pod.id)
+                self._set(
+                    ERROR,
+                    f"Could not hand the GPU pod its code ({problem}) -- "
+                    + ("the pod has been shut down, nothing is billing." if stopped else
+                       "and RunPod did not stop the pod: stop it in the RunPod console now."),
+                    error=problem,
+                )
+                self.state.billing = not stopped
+                report()
+                raise PodUnavailable(self.state.message)
             if boot_started is None:
                 # It was already running when we arrived; count from RunPod's own uptime.
                 boot_started = self._clock() - pod.uptime_s
@@ -576,11 +618,46 @@ class PodManager:
                 self.state.billing = not stopped
                 report()
                 raise PodUnavailable(self.state.message)
-            self._set(BOOTING, f"GPU pod is running; app starting ({_fmt_minutes(booting_for)} so far).", pod)
+            if not self._pushes_code:
+                doing = "app starting"
+            elif self._code_sent_to == pod.id:
+                doing = "code received, app starting"
+            else:
+                doing = "sending it the app code"
+            self._set(BOOTING, f"GPU pod is running; {doing} ({_fmt_minutes(booting_for)} so far).", pod)
             report()
             wait(self.cfg.poll_s)
 
     # ---------------------------------------------------------------- RunPod actions
+
+    @property
+    def _pushes_code(self) -> bool:
+        return self._code_bundle is not None and bool(self.cfg.pod_env.get("PV_POD_KEY"))
+
+    def _deliver_code(self, pod: PodInfo) -> str:
+        """Push the code to a booting pod whose receiver is waiting for it (docker/pod_receiver.py).
+        Asked on every boot poll: the probe is one small GET, and a container RunPod restarts is
+        waiting for the code again. Returns "" when all is well (sent, or nothing is waiting), or
+        why the code cannot be delivered at all -- it could not be packaged, or the pod refused
+        it -- which waiting longer will not fix."""
+        if not self._pushes_code:
+            return ""
+        url = rp.proxy_url(pod.id, self.cfg.port)
+        if not rp.pod_awaits_code(url, self._health_session):
+            return ""
+        self._code_sent_to = ""
+        try:
+            bundle, commit = self._code_bundle()  # type: ignore[misc]  # _pushes_code checked it
+            delivered = rp.push_code(url, self.cfg.pod_env["PV_POD_KEY"], bundle, commit, self._health_session)
+        except RunPodError as exc:
+            return str(exc)
+        except Exception as exc:  # packaging: git missing / not a checkout on the gateway
+            logger.exception("could not package the code for pod %s", pod.id)
+            return f"packaging it failed: {exc}"
+        if delivered:
+            self._code_sent_to = pod.id
+            logger.info("pod %s: sent it code %s (%d KB)", pod.id, commit, len(bundle) // 1024)
+        return ""
 
     def _volume(self) -> str:
         if self._volume_id:
